@@ -1,9 +1,9 @@
-const statusEl = document.getElementById("status");
+const ws = new WebSocket("wss://<din-worker>.workers.dev/ws?v=1");
 
-const map = L.map("map").setView([59.3293, 18.0686], 6); // Sverige
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-  maxZoom: 19,
-  attribution: '&copy; OpenStreetMap'
-}).addTo(map);
-
-statusEl.textContent = "Kartan är laddad.";
+ws.onopen = () => console.log("Connected to proxy");
+ws.onmessage = (ev) => {
+  // Oxyfi skickar normalt text/JSON
+  console.log("msg:", ev.data);
+};
+ws.onerror = (e) => console.error("ws error", e);
+ws.onclose = (e) => console.log("ws closed", e.code, e.reason);
