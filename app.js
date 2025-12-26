@@ -1,6 +1,4 @@
-const ws = new WebSocket("wss://train.etfnordic.workers.dev/ws?v=1");
-
-ws.onopen = () => console.log("OPEN ✅");
-ws.onmessage = (e) => console.log("MSG", String(e.data).slice(0, 120));
-ws.onerror = (e) => console.log("ERROR", e);
-ws.onclose = (e) => console.log("CLOSE", e.code, e.reason);
+const ws = new WebSocket("wss://train.etfnordic.workers.dev/echo");
+ws.onopen = () => { console.log("echo open"); ws.send("hello"); };
+ws.onmessage = (e) => console.log("echo msg:", e.data);
+ws.onclose = (e) => console.log("echo close:", e.code, e.reason);
