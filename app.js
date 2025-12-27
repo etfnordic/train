@@ -1,13 +1,11 @@
-// ====== KONFIG ======
 const WORKER_URL = "https://train.etfnordic.workers.dev";
 const REFRESH_MS = 15000;
+const MAX_AGE_MIN = 30; // döljer tåg som inte uppdaterats på 30 min
 
-// ====== UI ======
 const lastUpdateEl = document.getElementById("lastUpdate");
 const countEl = document.getElementById("count");
 const errorBox = document.getElementById("errorBox");
 
-// ====== KARTA ======
 const map = L.map("map", { zoomControl: true }).setView([62.0, 15.0], 5);
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
@@ -18,7 +16,6 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 const trainsLayer = L.layerGroup().addTo(map);
 const markersByKey = new Map();
 
-// ====== HELPERS ======
 function setError(msg) {
   if (!msg) {
     errorBox.hidden = true;
@@ -42,7 +39,7 @@ function formatTime(iso) {
   }
 }
 
-// Trafikverket skickar WGS84 som "POINT (lon lat)"
+// WGS84: "POINT (lon lat)"
 function parseWgs84Point(pointStr) {
   if (!pointStr || typeof pointStr !== "string") return null;
   const m = pointStr.match(/POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)/i);
@@ -55,7 +52,6 @@ function parseWgs84Point(pointStr) {
 
 function createArrowDivIcon(bearingDeg = 0) {
   const rot = Number.isFinite(bearingDeg) ? bearingDeg : 0;
-
   const svg = `
 <svg width="26" height="26" viewBox="0 0 26 26" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
   <path d="M13 2 L22 22 L13 18 L4 22 Z" fill="white" fill-opacity="0.92" stroke="black" stroke-opacity="0.25" stroke-width="1"/>
@@ -70,6 +66,7 @@ function createArrowDivIcon(bearingDeg = 0) {
   });
 }
 
+// CSS för pilar
 const style = document.createElement("style");
 style.textContent = `
 .train-arrow { background: transparent; border: none; }
@@ -78,52 +75,35 @@ style.textContent = `
 `;
 document.head.appendChild(style);
 
-function makeTrainKey(tp) {
-  const op = tp?.Train?.OperationalTrainNumber ?? "unknown";
-  const dep = tp?.Train?.OperationalTrainDepartureDate ?? "unknown";
-  return `${op}_${dep}`;
+function trainKey(t) {
+  return `${t?.opNum ?? "unknown"}_${t?.depDate ?? "unknown"}`;
 }
 
-function popupHtml(tp) {
-  const train = tp?.Train ?? {};
-  const status = tp?.Status ?? {};
-  const pos = tp?.Position ?? {};
-
-  // Notera: Bearing ligger på root i din data
-  const bearing = tp?.Bearing ?? "—";
-
+function popupHtml(t) {
   return `
-    <div style="min-width:250px">
+    <div style="min-width:240px">
       <div style="font-weight:800; font-size:14px; margin-bottom:6px;">
-        Tåg ${train.AdvertisedTrainNumber ?? "—"}
-        <span style="color:#9ca3af; font-weight:650;">(op: ${train.OperationalTrainNumber ?? "—"})</span>
+        Tåg ${t?.advNum ?? "—"} <span style="color:#9ca3af; font-weight:650;">(op: ${t?.opNum ?? "—"})</span>
       </div>
-
       <div style="font-size:13px; line-height:1.35;">
-        <div><b>Aktiv:</b> ${status.Active ?? "—"}</div>
-        <div><b>Riktning:</b> ${bearing}</div>
-        <div style="margin-top:6px;"><b>Senaste positions-tid:</b> ${formatTime(tp.TimeStamp)}</div>
-        <div><b>Ändrad:</b> ${formatTime(tp.ModifiedTime)}</div>
-
+        <div><b>Riktning:</b> ${t?.bearing ?? "—"}</div>
+        <div><b>Hastighet:</b> ${t?.speed ?? "—"}</div>
+        <div style="margin-top:6px;"><b>TimeStamp:</b> ${formatTime(t?.timeStamp)}</div>
+        <div><b>Modified:</b> ${formatTime(t?.modifiedTime)}</div>
         <div style="margin-top:6px; color:#9ca3af;">
-          <b>Avgångsdatum (trafikdygn):</b><br/>${train.OperationalTrainDepartureDate ?? "—"}
-        </div>
-
-        <div style="margin-top:6px; color:#9ca3af; word-break:break-word;">
-          <b>WGS84:</b> ${pos.WGS84 ?? "—"}
+          <b>Trafikdygn:</b><br/>${t?.depDate ?? "—"}
         </div>
       </div>
     </div>
   `;
 }
 
-// ====== DATA ======
-async function fetchTrainPositions() {
+async function fetchTrains() {
   setError("");
 
-  // cache-bust så browsern aldrig återanvänder gammalt svar
   const u = new URL(WORKER_URL);
-  u.searchParams.set("_", Date.now().toString());
+  u.searchParams.set("maxAgeMin", String(MAX_AGE_MIN));
+  u.searchParams.set("_", String(Date.now())); // cache-bust
 
   const res = await fetch(u.toString(), { method: "GET" });
   if (!res.ok) {
@@ -132,47 +112,39 @@ async function fetchTrainPositions() {
   }
 
   const json = await res.json();
-  const tps = json?.RESPONSE?.RESULT?.[0]?.TrainPosition ?? [];
-  return tps;
+  return json;
 }
 
-function upsertMarkers(trainPositions) {
-  const seenKeys = new Set();
+function upsertMarkers(trains) {
+  const seen = new Set();
 
-  for (const tp of trainPositions) {
-    // endast aktiva
-    if (tp?.Status?.Active !== true) continue;
+  for (const t of trains) {
+    const key = trainKey(t);
+    seen.add(key);
 
-    const key = makeTrainKey(tp);
-    seenKeys.add(key);
-
-    const pt = parseWgs84Point(tp?.Position?.WGS84);
+    const pt = parseWgs84Point(t?.wgs84);
     if (!pt) continue;
 
-    const bearing = tp?.Bearing ?? 0;
+    const bearing = t?.bearing ?? 0;
 
     const existing = markersByKey.get(key);
     if (existing) {
       existing.setLatLng([pt.lat, pt.lon]);
       existing.setIcon(createArrowDivIcon(bearing));
-      existing._tp = tp;
-      if (existing.isPopupOpen()) existing.setPopupContent(popupHtml(tp));
+      if (existing.isPopupOpen()) existing.setPopupContent(popupHtml(t));
     } else {
       const marker = L.marker([pt.lat, pt.lon], {
         icon: createArrowDivIcon(bearing),
         riseOnHover: true,
       });
-
-      marker._tp = tp;
-      marker.bindPopup(popupHtml(tp));
+      marker.bindPopup(popupHtml(t));
       marker.addTo(trainsLayer);
       markersByKey.set(key, marker);
     }
   }
 
-  // Ta bort markörer som inte längre syns i datasetet
   for (const [key, marker] of markersByKey.entries()) {
-    if (!seenKeys.has(key)) {
+    if (!seen.has(key)) {
       trainsLayer.removeLayer(marker);
       markersByKey.delete(key);
     }
@@ -183,10 +155,20 @@ function upsertMarkers(trainPositions) {
 
 async function refresh() {
   try {
-    const tps = await fetchTrainPositions();
-    upsertMarkers(tps);
+    const payload = await fetchTrains();
+    const trains = payload?.trains ?? [];
+    const meta = payload?.meta ?? {};
 
-    lastUpdateEl.textContent = `Uppdaterad ${formatTime(new Date().toISOString())}`;
+    upsertMarkers(trains);
+
+    lastUpdateEl.textContent = `Uppdaterad ${formatTime(meta.serverTime ?? new Date().toISOString())}`;
+
+    // Hjälp vid felsökning om det blir 0 eller orimligt
+    // console.log("meta", meta);
+
+    if (trains.length === 0) {
+      setError(`0 tåg efter filtrering.\nmeta: ${JSON.stringify(meta)}`);
+    }
   } catch (err) {
     setError(String(err?.message ?? err));
     console.error(err);
