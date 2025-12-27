@@ -5,14 +5,12 @@
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <title>Tåg i realtid – Sverige</title>
 
-    <!-- Leaflet -->
     <link
       rel="stylesheet"
       href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css"
       integrity="sha256-p4NxAoJBhIIN+hmNHrzRCf9tD/miZyoHS5obTRR9BMY="
       crossorigin=""
     />
-
     <link rel="stylesheet" href="./style.css" />
   </head>
 
@@ -21,7 +19,10 @@
       <div class="brand">🚆 Tåg i realtid</div>
       <div class="status">
         <span id="lastUpdate">—</span>
+        <span class="dot">•</span>
         <span id="count">0</span> tåg
+        <span class="dot">•</span>
+        <span id="freshWindow">—</span>
       </div>
     </header>
 
@@ -29,22 +30,22 @@
       <div id="map"></div>
 
       <div class="panel">
-        <div class="panel-title">Tips</div>
-        <ul>
-          <li>Klicka på ett tåg för detaljer.</li>
-          <li>Kartan uppdateras automatiskt.</li>
-        </ul>
+        <div class="panel-title">Info</div>
+        <div class="panel-text">
+          Visar tåg som har uppdaterats senaste <b id="minutesLabel">5</b> minuterna.
+        </div>
+        <div class="panel-text small">
+          <b>Obs:</b> “Avgångsdatum” är tågets <i>trafikdygn</i> (OperationalTrainDepartureDate), inte “senaste uppdatering”.
+        </div>
         <div class="panel-note" id="errorBox" hidden></div>
       </div>
     </main>
 
-    <!-- Leaflet JS -->
     <script
       src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"
       integrity="sha256-20nQCchB9co0qIjJZRGuk2/Z9VM+kNiyxNV1lvTlZBo="
       crossorigin=""
     ></script>
-
     <script src="./app.js"></script>
   </body>
 </html>
