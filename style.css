@@ -1,17 +1,14 @@
 :root {
   --bg: #0b1220;
-  --panel: rgba(17, 24, 39, 0.85);
+  --panel: rgba(17, 24, 39, 0.86);
   --text: #e5e7eb;
   --muted: #9ca3af;
   --border: rgba(255, 255, 255, 0.12);
 }
 
-* {
-  box-sizing: border-box;
-}
+* { box-sizing: border-box; }
 
-html,
-body {
+html, body {
   height: 100%;
   margin: 0;
   font-family: system-ui, -apple-system, Segoe UI, Roboto, Arial, sans-serif;
@@ -21,49 +18,41 @@ body {
 
 .topbar {
   position: fixed;
-  top: 0;
-  left: 0;
-  right: 0;
+  top: 0; left: 0; right: 0;
   height: 56px;
   display: flex;
   align-items: center;
   justify-content: space-between;
   padding: 0 14px;
-  background: rgba(3, 7, 18, 0.85);
+  background: rgba(3, 7, 18, 0.86);
   backdrop-filter: blur(8px);
   border-bottom: 1px solid var(--border);
   z-index: 1000;
 }
 
-.brand {
-  font-weight: 700;
-  letter-spacing: 0.2px;
-}
+.brand { font-weight: 800; letter-spacing: 0.2px; }
 
 .status {
   font-size: 14px;
   color: var(--muted);
   display: flex;
+  align-items: center;
   gap: 10px;
 }
+.dot { opacity: 0.7; }
 
-main {
-  height: 100%;
-}
+main { height: 100%; }
 
 #map {
   position: absolute;
-  top: 56px;
-  left: 0;
-  right: 0;
-  bottom: 0;
+  top: 56px; left: 0; right: 0; bottom: 0;
 }
 
 .panel {
   position: fixed;
   right: 12px;
   top: 68px;
-  width: 260px;
+  width: 320px;
   padding: 12px;
   background: var(--panel);
   border: 1px solid var(--border);
@@ -71,17 +60,9 @@ main {
   z-index: 1000;
 }
 
-.panel-title {
-  font-weight: 700;
-  margin-bottom: 8px;
-}
-
-.panel ul {
-  margin: 0;
-  padding-left: 18px;
-  color: var(--muted);
-  font-size: 14px;
-}
+.panel-title { font-weight: 800; margin-bottom: 8px; }
+.panel-text { font-size: 14px; color: var(--muted); line-height: 1.35; }
+.panel-text.small { font-size: 13px; margin-top: 8px; }
 
 .panel-note {
   margin-top: 10px;
@@ -94,18 +75,13 @@ main {
   white-space: pre-wrap;
 }
 
-/* Leaflet popup theme tweak */
 .leaflet-popup-content-wrapper {
   background: rgba(17, 24, 39, 0.95);
   color: var(--text);
   border: 1px solid var(--border);
   border-radius: 12px;
 }
-
-.leaflet-popup-tip {
-  background: rgba(17, 24, 39, 0.95);
-}
-
+.leaflet-popup-tip { background: rgba(17, 24, 39, 0.95); }
 .leaflet-control-attribution {
   background: rgba(0, 0, 0, 0.25) !important;
   color: var(--muted) !important;
