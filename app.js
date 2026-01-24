@@ -1,177 +1,208 @@
-const WORKER_URL = "https://train.etfnordic.workers.dev";
-const REFRESH_MS = 15000;
-const MAX_AGE_MIN = 30; // döljer tåg som inte uppdaterats på 30 min
+// ==========================
+// 1) KONFIG
+// ==========================
 
-const lastUpdateEl = document.getElementById("lastUpdate");
-const countEl = document.getElementById("count");
-const errorBox = document.getElementById("errorBox");
+// ÄNDRA DENNA till din worker-endpoint:
+const WORKER_URL = "https://trains.etfnordic.workers.dev/trains";
 
-const map = L.map("map", { zoomControl: true }).setView([62.0, 15.0], 5);
+// Hur ofta vi uppdaterar (ms)
+const REFRESH_MS = 5000;
+
+// Färgkarta per product.
+// Lägg bara till fler rader här när du upptäcker nya "product"-värden.
+const PRODUCT_COLORS = {
+  "Pågatågen": "#A855F7",     // lila
+  "Västtågen": "#2563EB",     // blå
+  "SJ InterCity": "#0EA5E9",
+  "X-Tåget": "#F97316",
+  "Snälltåget": "#22C55E",
+  "SL Pendeltåg": "#0EA5E9",
+  "Norrtåg": "#F43F5E",
+};
+
+// fallback om product saknas i listan
+const DEFAULT_COLOR = "#64748B"; // slate
+
+// ==========================
+// 2) KARTA
+// ==========================
+const map = L.map("map", { zoomControl: true }).setView([59.33, 18.06], 6);
 
 L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
   maxZoom: 19,
-  attribution: "&copy; OpenStreetMap-bidragsgivare",
+  attribution: "&copy; OpenStreetMap",
 }).addTo(map);
 
-const trainsLayer = L.layerGroup().addTo(map);
-const markersByKey = new Map();
+// ==========================
+// 3) STATE
+// ==========================
+/**
+ * markers: Map<key, L.Marker>
+ * key kan vara trainNo, men om du får krockar över dagar kan du använda `${depDate}_${trainNo}`
+ */
+const markers = new Map();
 
-function setError(msg) {
-  if (!msg) {
-    errorBox.hidden = true;
-    errorBox.textContent = "";
-    return;
-  }
-  errorBox.hidden = false;
-  errorBox.textContent = msg;
+let pinnedKey = null; // vilket tåg som är “fastnålat” (chip visas permanent)
+
+// Klick på karta => släpp pin
+map.on("click", () => {
+  pinnedKey = null;
+  // stäng alla tooltips som inte hovras
+  markers.forEach((m) => m.closeTooltip());
+});
+
+// ==========================
+// 4) HJÄLPFUNKTIONER
+// ==========================
+function colorForProduct(product) {
+  return PRODUCT_COLORS[product] ?? DEFAULT_COLOR;
 }
 
-function formatTime(iso) {
-  try {
-    const d = new Date(iso);
-    return new Intl.DateTimeFormat("sv-SE", {
-      hour: "2-digit",
-      minute: "2-digit",
-      second: "2-digit",
-    }).format(d);
-  } catch {
-    return iso ?? "—";
-  }
+function formatChipText(t) {
+  // Exempel: "Västtågen 3084 → Göteborg C · 57 km/h"
+  const base = `${t.product} ${t.trainNo} \u2192 ${t.to}`; // → (högerpil)
+  if (t.speed === null || t.speed === undefined) return base;
+  return `${base} \u00B7 ${t.speed} km/h`; // ·
 }
 
-// WGS84: "POINT (lon lat)"
-function parseWgs84Point(pointStr) {
-  if (!pointStr || typeof pointStr !== "string") return null;
-  const m = pointStr.match(/POINT\s*\(\s*([-\d.]+)\s+([-\d.]+)\s*\)/i);
-  if (!m) return null;
-  const lon = Number(m[1]);
-  const lat = Number(m[2]);
-  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-  return { lat, lon };
-}
-
-function createArrowDivIcon(bearingDeg = 0) {
-  const rot = Number.isFinite(bearingDeg) ? bearingDeg : 0;
-  const svg = `
-<svg width="26" height="26" viewBox="0 0 26 26" xmlns="http://www.w3.org/2000/svg" aria-hidden="true">
-  <path d="M13 2 L22 22 L13 18 L4 22 Z" fill="white" fill-opacity="0.92" stroke="black" stroke-opacity="0.25" stroke-width="1"/>
-</svg>`.trim();
-
-  return L.divIcon({
-    className: "train-arrow",
-    html: `<div class="arrow" style="transform: rotate(${rot}deg)">${svg}</div>`,
-    iconSize: [26, 26],
-    iconAnchor: [13, 13],
-    popupAnchor: [0, -12],
-  });
-}
-
-// CSS för pilar
-const style = document.createElement("style");
-style.textContent = `
-.train-arrow { background: transparent; border: none; }
-.train-arrow .arrow { width: 26px; height: 26px; transform-origin: 50% 50%; }
-.train-arrow svg { filter: drop-shadow(0 2px 3px rgba(0,0,0,0.35)); }
-`;
-document.head.appendChild(style);
-
-function trainKey(t) {
-  return `${t?.opNum ?? "unknown"}_${t?.depDate ?? "unknown"}`;
-}
-
-function popupHtml(t) {
+function makeArrowSvg(color) {
+  // Din location-arrow.svg fast inline för att kunna färgsätta + skala snabbt.
+  // Stroke = color (likt din pil)
   return `
-    <div style="min-width:240px">
-      <div style="font-weight:800; font-size:14px; margin-bottom:6px;">
-        Tåg ${t?.advNum ?? "—"} <span style="color:#9ca3af; font-weight:650;">(op: ${t?.opNum ?? "—"})</span>
-      </div>
-      <div style="font-size:13px; line-height:1.35;">
-        <div><b>Riktning:</b> ${t?.bearing ?? "—"}</div>
-        <div><b>Hastighet:</b> ${t?.speed ?? "—"}</div>
-        <div style="margin-top:6px;"><b>TimeStamp:</b> ${formatTime(t?.timeStamp)}</div>
-        <div><b>Modified:</b> ${formatTime(t?.modifiedTime)}</div>
-        <div style="margin-top:6px; color:#9ca3af;">
-          <b>Trafikdygn:</b><br/>${t?.depDate ?? "—"}
-        </div>
-      </div>
-    </div>
+    <svg viewBox="0 0 24 24" fill="none" aria-hidden="true">
+      <path d="M5.36328 12.0523C4.01081 11.5711 3.33457 11.3304 3.13309 10.9655C2.95849 10.6492 2.95032 10.2673 3.11124 9.94388C3.29694 9.57063 3.96228 9.30132 5.29295 8.76272L17.8356 3.68594C19.1461 3.15547 19.8014 2.89024 20.2154 3.02623C20.5747 3.14427 20.8565 3.42608 20.9746 3.7854C21.1106 4.19937 20.8453 4.85465 20.3149 6.16521L15.2381 18.7078C14.6995 20.0385 14.4302 20.7039 14.0569 20.8896C13.7335 21.0505 13.3516 21.0423 13.0353 20.8677C12.6704 20.6662 12.4297 19.99 11.9485 18.6375L10.4751 14.4967C10.3815 14.2336 10.3347 14.102 10.2582 13.9922C10.1905 13.8948 10.106 13.8103 10.0086 13.7426C9.89876 13.6661 9.76719 13.6193 9.50407 13.5257L5.36328 12.0523Z"
+        stroke="${color}" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+    </svg>
   `;
 }
 
-async function fetchTrains() {
-  setError("");
+function makeTrainDivIcon({ color, bearing }) {
+  const html = `
+    <div class="train-icon" style="transform: rotate(${bearing ?? 0}deg);">
+      ${makeArrowSvg(color)}
+    </div>
+  `;
 
-  const u = new URL(WORKER_URL);
-  u.searchParams.set("maxAgeMin", String(MAX_AGE_MIN));
-  u.searchParams.set("_", String(Date.now())); // cache-bust
-
-  const res = await fetch(u.toString(), { method: "GET" });
-  if (!res.ok) {
-    const txt = await res.text().catch(() => "");
-    throw new Error(`Worker HTTP ${res.status}\n${txt}`);
-  }
-
-  const json = await res.json();
-  return json;
+  return L.divIcon({
+    className: "", // vi styr allt själva
+    html,
+    iconSize: [34, 34],
+    iconAnchor: [17, 17], // center
+  });
 }
 
-function upsertMarkers(trains) {
-  const seen = new Set();
+function bindChip(marker, t, color, key) {
+  const text = formatChipText(t);
 
-  for (const t of trains) {
-    const key = trainKey(t);
-    seen.add(key);
+  // Tooltip-innehåll: chip med samma färg som pilen
+  const chipHtml = `
+    <div class="chip" style="background:${color};">
+      <span class="pill">${t.trainNo}</span>
+      <span>${text}</span>
+    </div>
+  `;
 
-    const pt = parseWgs84Point(t?.wgs84);
-    if (!pt) continue;
+  marker.bindTooltip(chipHtml, {
+    direction: "top",
+    offset: [0, -18],
+    opacity: 1,
+    className: "train-chip",
+    permanent: false,
+    interactive: true,
+  });
 
-    const bearing = t?.bearing ?? 0;
+  // Hover => visa chip om inte något annat är pinnat
+  marker.on("mouseover", () => {
+    if (pinnedKey === null || pinnedKey === key) marker.openTooltip();
+  });
 
-    const existing = markersByKey.get(key);
-    if (existing) {
-      existing.setLatLng([pt.lat, pt.lon]);
-      existing.setIcon(createArrowDivIcon(bearing));
-      if (existing.isPopupOpen()) existing.setPopupContent(popupHtml(t));
-    } else {
-      const marker = L.marker([pt.lat, pt.lon], {
-        icon: createArrowDivIcon(bearing),
-        riseOnHover: true,
-      });
-      marker.bindPopup(popupHtml(t));
-      marker.addTo(trainsLayer);
-      markersByKey.set(key, marker);
-    }
+  marker.on("mouseout", () => {
+    // Stäng om den inte är pinnad
+    if (pinnedKey !== key) marker.closeTooltip();
+  });
+
+  // Klick => “fäst” chipet
+  marker.on("click", (e) => {
+    L.DomEvent.stopPropagation(e); // så kartklick inte triggas
+    pinnedKey = key;
+    marker.openTooltip();
+  });
+}
+
+function upsertTrain(t) {
+  const key = `${t.depDate}_${t.trainNo}`; // robust mot krockar
+  const color = colorForProduct(t.product);
+
+  // om cancelled: tona ned lite
+  const opacity = t.canceled ? 0.35 : 1;
+
+  if (!markers.has(key)) {
+    const icon = makeTrainDivIcon({ color, bearing: t.bearing });
+    const marker = L.marker([t.lat, t.lon], { icon, opacity }).addTo(map);
+
+    bindChip(marker, t, color, key);
+    markers.set(key, marker);
+  } else {
+    const marker = markers.get(key);
+
+    // Uppdatera position + opacity
+    marker.setLatLng([t.lat, t.lon]);
+    marker.setOpacity(opacity);
+
+    // Uppdatera ikon (färg + rotation + ev product-ändring)
+    marker.setIcon(makeTrainDivIcon({ color, bearing: t.bearing }));
+
+    // Uppdatera tooltip-text
+    const chipHtml = `
+      <div class="chip" style="background:${color};">
+        <span class="pill">${t.trainNo}</span>
+        <span>${formatChipText(t)}</span>
+      </div>
+    `;
+    marker.setTooltipContent(chipHtml);
+
+    // Om pinnad, håll den öppen
+    if (pinnedKey === key) marker.openTooltip();
   }
 
-  for (const [key, marker] of markersByKey.entries()) {
-    if (!seen.has(key)) {
-      trainsLayer.removeLayer(marker);
-      markersByKey.delete(key);
-    }
-  }
+  return key;
+}
 
-  countEl.textContent = String(markersByKey.size);
+// ==========================
+// 5) HÄMTA & RITA
+// ==========================
+async function fetchTrains() {
+  const res = await fetch(WORKER_URL, { cache: "no-store" });
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  return res.json();
 }
 
 async function refresh() {
   try {
-    const payload = await fetchTrains();
-    const trains = payload?.trains ?? [];
-    const meta = payload?.meta ?? {};
+    const trains = await fetchTrains();
 
-    upsertMarkers(trains);
+    // Håll koll på vilka som finns i senaste pullen
+    const seen = new Set();
 
-    lastUpdateEl.textContent = `Uppdaterad ${formatTime(meta.serverTime ?? new Date().toISOString())}`;
+    for (const t of trains) {
+      // säkerhetskoll om något saknas
+      if (typeof t.lat !== "number" || typeof t.lon !== "number") continue;
+      if (!t.trainNo) continue;
 
-    // Hjälp vid felsökning om det blir 0 eller orimligt
-    // console.log("meta", meta);
+      const key = upsertTrain(t);
+      seen.add(key);
+    }
 
-    if (trains.length === 0) {
-      setError(`0 tåg efter filtrering.\nmeta: ${JSON.stringify(meta)}`);
+    // Ta bort markers som inte längre rapporteras
+    for (const [key, marker] of markers.entries()) {
+      if (!seen.has(key)) {
+        if (pinnedKey === key) pinnedKey = null;
+        map.removeLayer(marker);
+        markers.delete(key);
+      }
     }
   } catch (err) {
-    setError(String(err?.message ?? err));
-    console.error(err);
+    console.error("Kunde inte uppdatera tåg:", err);
   }
 }
 
