@@ -5,7 +5,9 @@ const PRODUCT_COLORS = {
   "Pågatågen": "#A855F7",
   "Västtågen": "#2563EB",
   "Krösatågen": "#F59E0B",
-  "TiB": "#10B981",
+  "Tåg i Bergslagen": "#10B981",
+  "Värmlandstrafik": "#10B981",
+  "Arlanda Express": "#22C55E",
   "SJ InterCity": "#0EA5E9",
   "X-Tåget": "#F97316",
   "Snälltåget": "#22C55E",
@@ -27,7 +29,12 @@ const markers = new Map();         // key -> marker
 const trainDataByKey = new Map();  // key -> train
 let pinnedKey = null;
 
+// För hastighetsestimat (när worker skickar null / pendel-"1")
+// key -> { lat, lon, tsMs }
+const lastSampleByKey = new Map();
+
 let filterQuery = "";
+let userInteractedSinceSearch = false;
 
 // Släpp pin på kartklick (snabbt)
 map.on("click", () => {
@@ -44,7 +51,8 @@ function normalize(s) {
 
 function matchesFilter(t) {
   if (!filterQuery) return true;
-  const hay = `${t.trainNo} ${t.operator} ${t.to}`.toLowerCase();
+  // Endast tågnummer + product
+  const hay = `${t.trainNo} ${t.product}`.toLowerCase();
   return hay.includes(filterQuery);
 }
 
@@ -65,7 +73,7 @@ function applyFilterAndMaybeZoom() {
   }
 
   // 2) auto-zoom om exakt 1 match
-  if (filterQuery && matchKeys.length === 1) {
+  if (filterQuery && matchKeys.length === 1 && !userInteractedSinceSearch) {
     const key = matchKeys[0];
     const marker = markers.get(key);
     if (marker) {
@@ -91,6 +99,7 @@ searchEl.addEventListener(
   "input",
   debounce(() => {
     filterQuery = normalize(searchEl.value);
+    userInteractedSinceSearch = false;
     applyFilterAndMaybeZoom();
   }, 120),
 );
@@ -98,8 +107,17 @@ searchEl.addEventListener(
 clearBtn.addEventListener("click", () => {
   searchEl.value = "";
   filterQuery = "";
+  userInteractedSinceSearch = false;
   applyFilterAndMaybeZoom();
   searchEl.focus();
+});
+
+// Om användaren panorerar/zoomar efter en sökning ska vi inte "dra tillbaka" kameran
+map.on("dragstart", () => {
+  userInteractedSinceSearch = true;
+});
+map.on("zoomstart", () => {
+  userInteractedSinceSearch = true;
 });
 
 // ===== HELPERS =====
@@ -140,7 +158,8 @@ function makeArrowSvg(color) {
 function formatChipText(t) {
   const base = `${t.product} ${t.trainNo} \u2192 ${t.to}`;
   if (t.speed === null || t.speed === undefined) return base;
-  return `${base} \u00B7 ${t.speed} km/h`;
+  const prefix = t._speedEstimated ? "~" : "";
+  return `${base} \u00B7 ${prefix}${t.speed} km/h`;
 }
 
 // logos: baserat på product
@@ -201,15 +220,22 @@ function setGlow(marker, on) {
 }
 
 function bindTooltip(marker, t, color, permanent) {
+  // Används endast vid init + vid pin/unpin (inte varje refresh)
   marker.unbindTooltip();
   marker.bindTooltip(chipHtml(t, color), {
     direction: "top",
     offset: [0, -18],
     opacity: 1,
-    className: "train-chip",
+    className: permanent ? "train-chip pinned" : "train-chip",
     permanent,
     interactive: true,
   });
+}
+
+function updateTooltipContent(marker, t, color) {
+  const tooltip = marker.getTooltip?.();
+  if (!tooltip) return;
+  tooltip.setContent(chipHtml(t, color));
 }
 
 function unpinCurrent() {
@@ -247,11 +273,13 @@ function pinMarker(key) {
 // men om den är pinnad så är den redan permanent.
 function attachHoverAndClick(marker, key) {
   marker.on("mouseover", () => {
-    if (!pinnedKey) marker.openTooltip();
+    // Man ska kunna hovera andra tåg även när något är pinnat
+    marker.openTooltip();
   });
 
   marker.on("mouseout", () => {
-    if (!pinnedKey) marker.closeTooltip();
+    // Stäng bara om den här inte är pinnad
+    if (pinnedKey !== key) marker.closeTooltip();
   });
 
   marker.on("click", (e) => {
@@ -259,6 +287,76 @@ function attachHoverAndClick(marker, key) {
     // Pin direkt utan extra logik som triggar re-render
     pinMarker(key);
   });
+}
+
+// ===== DATA-NORMALISERING =====
+function normalizeProduct(rawProduct) {
+  if (rawProduct === "TiB") return "Tåg i Bergslagen";
+  if (rawProduct === "VTAB") return "Värmlandstrafik";
+  return rawProduct;
+}
+
+function haversineKm(lat1, lon1, lat2, lon2) {
+  const R = 6371;
+  const toRad = (d) => (d * Math.PI) / 180;
+  const dLat = toRad(lat2 - lat1);
+  const dLon = toRad(lon2 - lon1);
+  const a =
+    Math.sin(dLat / 2) ** 2 +
+    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(a));
+}
+
+function normalizeTrain(tIn) {
+  const t = { ...tIn };
+
+  // Product-display
+  t.product = normalizeProduct(t.product);
+
+  // Arlanda Express-regel
+  const n = Number(t.trainNo);
+  if (Number.isFinite(n) && n >= 7700 && n <= 7999) {
+    t.product = "Arlanda Express";
+    t.to = n % 2 === 1 ? "Stockholm C" : "Arlanda";
+  }
+
+  // SL Pendeltåg: "1 km/h" verkar vara default -> behandla som null
+  if (t.product === "SL Pendeltåg" && t.speed === 1) {
+    t.speed = null;
+  }
+
+  // Hastighetsestimat om null
+  t._speedEstimated = false;
+  if (t.speed === null || t.speed === undefined) {
+    const key = `${t.depDate}_${t.trainNo}`;
+    const prev = lastSampleByKey.get(key);
+    const tsMs = Date.parse(t.timeStamp ?? "");
+    if (prev && Number.isFinite(tsMs) && tsMs > prev.tsMs) {
+      const dtH = (tsMs - prev.tsMs) / 3_600_000;
+      if (dtH > 0) {
+        const distKm = haversineKm(prev.lat, prev.lon, t.lat, t.lon);
+        const est = distKm / dtH;
+        if (Number.isFinite(est) && est > 1) {
+          t.speed = Math.round(est);
+          t._speedEstimated = true;
+        }
+      }
+    }
+
+    // Uppdatera sample även om vi inte kunde estimera (så nästa gång kan funka)
+    if (Number.isFinite(tsMs)) {
+      lastSampleByKey.set(key, { lat: t.lat, lon: t.lon, tsMs });
+    }
+  } else {
+    // Har "riktig" speed -> uppdatera sample för framtida estimat
+    const key = `${t.depDate}_${t.trainNo}`;
+    const tsMs = Date.parse(t.timeStamp ?? "");
+    if (Number.isFinite(tsMs)) {
+      lastSampleByKey.set(key, { lat: t.lat, lon: t.lon, tsMs });
+    }
+  }
+
+  return t;
 }
 
 // ===== FETCH =====
@@ -273,6 +371,7 @@ async function fetchTrains() {
 
 // ===== UPSERT =====
 function upsertTrain(t) {
+  t = normalizeTrain(t);
   const key = `${t.depDate}_${t.trainNo}`;
   trainDataByKey.set(key, t);
 
@@ -300,10 +399,10 @@ function upsertTrain(t) {
     marker.setIcon(makeTrainDivIcon({ color, bearing: t.bearing }));
     marker.setOpacity(opacity);
 
-    // uppdatera tooltip-content, behåll permanent om pinnad
-    const isPinned = pinnedKey === key;
-    bindTooltip(marker, t, color, isPinned);
+    // Uppdatera tooltip-content utan att re-binda (minskar lagg rejält)
+    updateTooltipContent(marker, t, color);
 
+    const isPinned = pinnedKey === key;
     if (isPinned) {
       setGlow(marker, true);
       marker.openTooltip();
@@ -316,6 +415,7 @@ function upsertTrain(t) {
 // ===== LOOP =====
 async function refresh() {
   try {
+    if (document.hidden) return; // spara CPU + data när fliken inte är aktiv
     const trains = await fetchTrains();
     const seen = new Set();
 
@@ -333,6 +433,7 @@ async function refresh() {
         if (map.hasLayer(marker)) map.removeLayer(marker);
         markers.delete(key);
         trainDataByKey.delete(key);
+        lastSampleByKey.delete(key);
       }
     }
 
@@ -342,5 +443,19 @@ async function refresh() {
   }
 }
 
-refresh();
-setInterval(refresh, REFRESH_MS);
+// ===== SCHEDULER =====
+// Undvik overlap + uppdatera inte när fliken är dold
+let refreshTimer = null;
+async function tick() {
+  await refresh();
+  refreshTimer = setTimeout(tick, REFRESH_MS);
+}
+
+document.addEventListener("visibilitychange", () => {
+  if (!document.hidden) {
+    // Direkt refresh när man kommer tillbaka
+    refresh();
+  }
+});
+
+tick();
