@@ -7,12 +7,23 @@ const PRODUCT_COLORS = {
   "Krösatågen": "#F59E0B",
   "Tåg i Bergslagen": "#10B981",
   "Värmlandstrafik": "#10B981",
-  "Arlanda Express": "#22C55E",
+  "Arlanda Express": "#FEF380",
   "SJ InterCity": "#0EA5E9",
+  "SJ Nattåg": "#0EA5E9",
+  "SJ EuroNight": "#0EA5E9",
+  "SJ Snabbtåg": "#0EA5E9",
+  "SJ Regional": "#0EA5E9",
+  "Vy Snabbtåg": "#0EA5E9",
+  "Vy": "#0EA5E9",
   "X-Tåget": "#F97316",
   "Snälltåget": "#22C55E",
   "SL Pendeltåg": "#0EA5E9",
   "Norrtåg": "#F43F5E",
+  "Östgötapendeln": "#0EA5E9",
+  "Tågab": "#0EA5E9",
+  "Öresundståg": "#0EA5E9",
+  "VR Snabbtåg": "#0EA5E9",
+
 };
 const DEFAULT_COLOR = "#64748B";
 
