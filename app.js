@@ -25,13 +25,15 @@ L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
 }).addTo(map);
 
 // ===== STATE =====
-const markers = new Map();         // key -> marker
-const trainDataByKey = new Map();  // key -> train
+const markers = new Map(); // key -> marker
+const trainDataByKey = new Map(); // key -> train
 let pinnedKey = null;
 
 // För hastighetsestimat (när worker skickar null / pendel-"1")
-// key -> { lat, lon, tsMs }
-const lastSampleByKey = new Map();
+// key -> [{ lat, lon, tsMs }, ...] (senaste sist)
+const lastSamplesByKey = new Map();
+// key -> { speed, tsMs } (senaste estimerade/smoothede hastighet)
+const lastEstSpeedByKey = new Map();
 
 let filterQuery = "";
 let userInteractedSinceSearch = false;
@@ -125,6 +127,30 @@ function colorForProduct(product) {
   return PRODUCT_COLORS[product] ?? DEFAULT_COLOR;
 }
 
+function hexToRgb(hex) {
+  const h = String(hex ?? "").trim();
+  const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h);
+  if (!m) return null;
+  return {
+    r: parseInt(m[1], 16),
+    g: parseInt(m[2], 16),
+    b: parseInt(m[3], 16),
+  };
+}
+
+function bestTextColor(bgHex) {
+  // WCAG-ish luminans (0..1)
+  const rgb = hexToRgb(bgHex);
+  if (!rgb) return "#fff";
+  const srgb = [rgb.r, rgb.g, rgb.b].map((v) => {
+    const x = v / 255;
+    return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
+  });
+  const L = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
+  // tröskel som ger "bäst" kontrast i praktiken
+  return L > 0.55 ? "#0B1220" : "#ffffff";
+}
+
 // Bearing offset: DU SA “mitt emellan nu och innan”.
 // Innan: 0 offset (pekade höger). Sen: -90 (blev fel åt andra hållet).
 // “Mittemellan” = -45. Du kan fintrimma här om du vill (+/- 10).
@@ -179,8 +205,9 @@ function productLogoPath(product) {
 
 function chipHtml(t, color) {
   const logo = productLogoPath(t.product);
+  const textColor = bestTextColor(color);
   return `
-    <div class="chip" style="background:${color};">
+    <div class="chip" style="background:${color}; color:${textColor};">
       <img class="logo" src="${logo}" alt="${t.product}" onerror="this.style.display='none'">
       <span>${formatChipText(t)}</span>
     </div>
@@ -206,13 +233,6 @@ function animateMarkerTo(marker, toLatLng, durationMs = 850) {
 }
 
 // ===== PIN/UNPIN utan lagg =====
-//
-// Vi gör “pin” genom att:
-// - stänga tidigare pinnad tooltip
-// - toggla CSS glow via marker.getElement().classList
-// - göra tooltip “permanent” endast för pinnad marker
-//
-// Rebind sker bara för 2 markers (förra + nya), det håller det snabbt.
 function setGlow(marker, on) {
   const el = marker.getElement();
   if (!el) return;
@@ -269,8 +289,6 @@ function pinMarker(key) {
   marker.openTooltip();
 }
 
-// Hover-beteende: vi låter Leaflet visa tooltip (non-permanent),
-// men om den är pinnad så är den redan permanent.
 function attachHoverAndClick(marker, key) {
   marker.on("mouseover", () => {
     // Man ska kunna hovera andra tåg även när något är pinnat
@@ -284,7 +302,6 @@ function attachHoverAndClick(marker, key) {
 
   marker.on("click", (e) => {
     L.DomEvent.stop(e);
-    // Pin direkt utan extra logik som triggar re-render
     pinMarker(key);
   });
 }
@@ -307,6 +324,86 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
+const MAX_SAMPLES = 6;
+const MIN_EST_DT_MS = 15_000; // minst 15s för att minska jitter
+const MIN_EST_DIST_KM = 0.05; // ignorera små hopp
+const REUSE_EST_MS = 90_000; // återanvänd senaste est om vi saknar bra underlag
+
+const MAX_SPEED_BY_PRODUCT = {
+  "SL Pendeltåg": 170,
+  "Pågatågen": 200,
+  "Västtågen": 200,
+  "Krösatågen": 180,
+  "Tåg i Bergslagen": 200,
+  "Värmlandstrafik": 200,
+  "Arlanda Express": 220,
+  "SJ InterCity": 200,
+  "X-Tåget": 200,
+  "Snälltåget": 230,
+  "Norrtåg": 200,
+};
+
+function maxPlausibleSpeed(product) {
+  return MAX_SPEED_BY_PRODUCT[product] ?? 250;
+}
+
+function pushSample(key, sample) {
+  const arr = lastSamplesByKey.get(key) ?? [];
+  const last = arr[arr.length - 1];
+
+  // om timestamp är samma, ersätt senaste (minskar "fladder")
+  if (last && last.tsMs === sample.tsMs) {
+    arr[arr.length - 1] = sample;
+  } else {
+    arr.push(sample);
+  }
+
+  // trim
+  while (arr.length > MAX_SAMPLES) arr.shift();
+  lastSamplesByKey.set(key, arr);
+  return arr;
+}
+
+function estimateSpeedFromSamples(key, product, current) {
+  const arr = lastSamplesByKey.get(key);
+  if (!arr || arr.length < 2) return null;
+
+  // hitta en sample som är minst MIN_EST_DT_MS äldre än current
+  const targetTs = current.tsMs - MIN_EST_DT_MS;
+  let base = null;
+  for (let i = arr.length - 2; i >= 0; i--) {
+    if (arr[i].tsMs <= targetTs) {
+      base = arr[i];
+      break;
+    }
+  }
+  if (!base) return null;
+
+  const dtMs = current.tsMs - base.tsMs;
+  if (dtMs <= 0) return null;
+
+  const distKm = haversineKm(base.lat, base.lon, current.lat, current.lon);
+  if (!Number.isFinite(distKm) || distKm < MIN_EST_DIST_KM) return null;
+
+  const est = (distKm / (dtMs / 3_600_000));
+  if (!Number.isFinite(est) || est < 2) return null;
+
+  const max = maxPlausibleSpeed(product);
+  // om den är helt orimlig (ofta pga GPS-jitter), underkänn
+  if (est > max * 1.35) return null;
+
+  return Math.min(est, max);
+}
+
+function smoothEstimate(key, rawEst, tsMs) {
+  const prev = lastEstSpeedByKey.get(key);
+  if (prev && Number.isFinite(prev.speed) && (tsMs - prev.tsMs) <= REUSE_EST_MS) {
+    // EMA-ish: behåll lite av tidigare för stabilitet
+    return 0.65 * prev.speed + 0.35 * rawEst;
+  }
+  return rawEst;
+}
+
 function normalizeTrain(tIn) {
   const t = { ...tIn };
 
@@ -325,34 +422,30 @@ function normalizeTrain(tIn) {
     t.speed = null;
   }
 
+  const key = `${t.depDate}_${t.trainNo}`;
+  const tsMs = Date.parse(t.timeStamp ?? "");
+  if (Number.isFinite(tsMs) && typeof t.lat === "number" && typeof t.lon === "number") {
+    pushSample(key, { lat: t.lat, lon: t.lon, tsMs });
+  }
+
   // Hastighetsestimat om null
   t._speedEstimated = false;
   if (t.speed === null || t.speed === undefined) {
-    const key = `${t.depDate}_${t.trainNo}`;
-    const prev = lastSampleByKey.get(key);
-    const tsMs = Date.parse(t.timeStamp ?? "");
-    if (prev && Number.isFinite(tsMs) && tsMs > prev.tsMs) {
-      const dtH = (tsMs - prev.tsMs) / 3_600_000;
-      if (dtH > 0) {
-        const distKm = haversineKm(prev.lat, prev.lon, t.lat, t.lon);
-        const est = distKm / dtH;
-        if (Number.isFinite(est) && est > 1) {
-          t.speed = Math.round(est);
+    if (Number.isFinite(tsMs)) {
+      const raw = estimateSpeedFromSamples(key, t.product, { lat: t.lat, lon: t.lon, tsMs });
+      if (raw !== null) {
+        const smoothed = smoothEstimate(key, raw, tsMs);
+        t.speed = Math.round(smoothed);
+        t._speedEstimated = true;
+        lastEstSpeedByKey.set(key, { speed: t.speed, tsMs });
+      } else {
+        // saknar bra underlag just nu -> återanvänd senaste rimliga estimat
+        const prev = lastEstSpeedByKey.get(key);
+        if (prev && Number.isFinite(prev.speed) && (tsMs - prev.tsMs) <= REUSE_EST_MS) {
+          t.speed = prev.speed;
           t._speedEstimated = true;
         }
       }
-    }
-
-    // Uppdatera sample även om vi inte kunde estimera (så nästa gång kan funka)
-    if (Number.isFinite(tsMs)) {
-      lastSampleByKey.set(key, { lat: t.lat, lon: t.lon, tsMs });
-    }
-  } else {
-    // Har "riktig" speed -> uppdatera sample för framtida estimat
-    const key = `${t.depDate}_${t.trainNo}`;
-    const tsMs = Date.parse(t.timeStamp ?? "");
-    if (Number.isFinite(tsMs)) {
-      lastSampleByKey.set(key, { lat: t.lat, lon: t.lon, tsMs });
     }
   }
 
@@ -433,7 +526,8 @@ async function refresh() {
         if (map.hasLayer(marker)) map.removeLayer(marker);
         markers.delete(key);
         trainDataByKey.delete(key);
-        lastSampleByKey.delete(key);
+        lastSamplesByKey.delete(key);
+        lastEstSpeedByKey.delete(key);
       }
     }
 
