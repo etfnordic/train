@@ -23,22 +23,92 @@ const PRODUCT_COLORS = {
   "Tågab": "#0EA5E9",
   "Öresundståg": "#0EA5E9",
   "VR Snabbtåg": "#0EA5E9",
-
 };
 const DEFAULT_COLOR = "#64748B";
 
 // ===== KARTA =====
 const map = L.map("map", { zoomControl: true }).setView([59.33, 18.06], 6);
-
-L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
   maxZoom: 19,
-  attribution: "&copy; OpenStreetMap",
+  attribution:
+    '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, ' +
+    'Tiles style by <a href="https://www.hotosm.org/">Humanitarian OpenStreetMap Team</a>',
 }).addTo(map);
+
+// GPS-position
+let userMarker = null;
+let userAccuracyCircle = null;
+let userWatchId = null;
+let followUser = false; // true för att följa
+
+function makeUserIcon() {
+  return L.divIcon({
+    className: "userLocWrap",
+    html: `<div class="userLocDot"></div>`,
+    iconSize: [20, 20],
+    iconAnchor: [10, 10],
+  });
+}
+
+function startUserLocation() {
+  if (!("geolocation" in navigator)) {
+    console.warn("Geolocation stöds inte i den här webbläsaren.");
+    return;
+  }
+
+  // Starta live-uppdatering
+  userWatchId = navigator.geolocation.watchPosition(
+    (pos) => {
+      const { latitude, longitude, accuracy } = pos.coords;
+      const latlng = [latitude, longitude];
+
+      if (!userMarker) {
+        userMarker = L.marker(latlng, { icon: makeUserIcon(), zIndexOffset: 3000 })
+          .addTo(map)
+          .bindPopup("Din position");
+
+        userAccuracyCircle = L.circle(latlng, {
+          radius: Math.max(accuracy || 0, 10),
+          weight: 1,
+          opacity: 0.4,
+          fillOpacity: 0.12,
+        }).addTo(map);
+      } else {
+        userMarker.setLatLng(latlng);
+        userAccuracyCircle.setLatLng(latlng);
+        userAccuracyCircle.setRadius(Math.max(accuracy || 0, 10));
+      }
+
+      if (followUser) {
+        map.setView(latlng, Math.max(map.getZoom(), 14), { animate: true });
+      }
+    },
+    (err) => {
+      console.warn("GPS-fel:", err?.message || err);
+    },
+    {
+      enableHighAccuracy: true,
+      maximumAge: 1500,
+      timeout: 10000,
+    }
+  );
+}
 
 // ===== STATE =====
 const markers = new Map(); // key -> marker
 const trainDataByKey = new Map(); // key -> train
+
+// ===== LABEL SYSTEM (SL-style) =====
+let hoverKey = null;
+let hoverLabelMarker = null;
+
 let pinnedKey = null;
+let pinnedLabelMarker = null;
+
+let isPointerOverTrain = false;
+
+// Justera om chip sitter för nära/för långt: (px uppåt)
+const LABEL_OFFSET_Y_PX = 18;
 
 // För hastighetsestimat (när worker skickar null / pendel-"1")
 // key -> [{ lat, lon, tsMs }, ...] (senaste sist)
@@ -48,11 +118,6 @@ const lastEstSpeedByKey = new Map();
 
 let filterQuery = "";
 let userInteractedSinceSearch = false;
-
-// Släpp pin på kartklick (snabbt)
-map.on("click", () => {
-  unpinCurrent();
-});
 
 // ===== SÖK =====
 const searchEl = document.getElementById("search");
@@ -81,7 +146,10 @@ function applyFilterAndMaybeZoom() {
       matchKeys.push(key);
     } else {
       if (map.hasLayer(marker)) map.removeLayer(marker);
-      if (pinnedKey === key) pinnedKey = null;
+
+      // om ett dolt tåg var pinnat/hoverat -> släpp
+      if (pinnedKey === key) clearPinnedLabel();
+      if (hoverKey === key) clearHoverLabel();
     }
   }
 
@@ -90,12 +158,11 @@ function applyFilterAndMaybeZoom() {
     const key = matchKeys[0];
     const marker = markers.get(key);
     if (marker) {
-      // passa in lite tajt, men utan att bli för nära
       const ll = marker.getLatLng();
       map.setView(ll, Math.max(map.getZoom(), 10), { animate: true });
 
-      // visa chip även om inget är pinnat
-      marker.openTooltip();
+      // visa label även om inget är pinnat
+      showHoverLabelForKey(key);
     }
   }
 }
@@ -158,13 +225,10 @@ function bestTextColor(bgHex) {
     return x <= 0.03928 ? x / 12.92 : ((x + 0.055) / 1.055) ** 2.4;
   });
   const L = 0.2126 * srgb[0] + 0.7152 * srgb[1] + 0.0722 * srgb[2];
-  // tröskel som ger "bäst" kontrast i praktiken
   return L > 0.55 ? "#0B1220" : "#ffffff";
 }
 
-// Bearing offset: DU SA “mitt emellan nu och innan”.
-// Innan: 0 offset (pekade höger). Sen: -90 (blev fel åt andra hållet).
-// “Mittemellan” = -45. Du kan fintrimma här om du vill (+/- 10).
+// Bearing offset: “mittemellan” = -45
 const BEARING_OFFSET_DEG = -45;
 
 function makeTrainDivIcon({ color, bearing }) {
@@ -225,96 +289,198 @@ function chipHtml(t, color) {
   `;
 }
 
-// ===== Smooth move =====
-function lerp(a, b, t) {
-  return a + (b - a) * t;
+// ===== Label icon (SL-style) =====
+function makeLabelDivIcon(t, color, pinned) {
+  // Vi använder samma className som tidigare tooltips hade, så din CSS fortsätter gälla.
+  // Inline transform placerar chipet ovanför punkten (utan Leaflet tooltip-system).
+  const wrapper = `
+    <div style="transform: translate(-50%, calc(-100% - ${LABEL_OFFSET_Y_PX}px)); pointer-events: none;">
+      ${chipHtml(t, color)}
+    </div>
+  `;
+  return L.divIcon({
+    className: pinned ? "train-chip pinned" : "train-chip",
+    html: wrapper,
+    // Leaflet kräver ofta iconSize, men vi låter innehållet styra och sätter minimal.
+    iconSize: [1, 1],
+    iconAnchor: [0, 0],
+  });
 }
 
-function animateMarkerTo(marker, toLatLng, durationMs = 850) {
-  const from = marker.getLatLng();
-  const to = L.latLng(toLatLng[0], toLatLng[1]);
-  const start = performance.now();
-
-  function step(now) {
-    const t = Math.min(1, (now - start) / durationMs);
-    marker.setLatLng([lerp(from.lat, to.lat, t), lerp(from.lng, to.lng, t)]);
-    if (t < 1) requestAnimationFrame(step);
-  }
-  requestAnimationFrame(step);
-}
-
-// ===== PIN/UNPIN utan lagg =====
 function setGlow(marker, on) {
   const el = marker.getElement();
   if (!el) return;
   el.classList.toggle("train-selected", on);
 }
 
-function bindTooltip(marker, t, color, permanent) {
-  // Används endast vid init + vid pin/unpin (inte varje refresh)
-  marker.unbindTooltip();
-  marker.bindTooltip(chipHtml(t, color), {
-    direction: "top",
-    offset: [0, -18],
-    opacity: 1,
-    className: permanent ? "train-chip pinned" : "train-chip",
-    permanent,
-    interactive: true,
-  });
+function clearHoverLabel() {
+  if (hoverLabelMarker) {
+    map.removeLayer(hoverLabelMarker);
+    hoverLabelMarker = null;
+  }
+  hoverKey = null;
 }
 
-function updateTooltipContent(marker, t, color) {
-  const tooltip = marker.getTooltip?.();
-  if (!tooltip) return;
-  tooltip.setContent(chipHtml(t, color));
-}
+function clearPinnedLabel() {
+  if (pinnedKey) {
+    const m = markers.get(pinnedKey);
+    if (m) setGlow(m, false);
+  }
 
-function unpinCurrent() {
-  if (!pinnedKey) return;
-  const prev = markers.get(pinnedKey);
-  const t = trainDataByKey.get(pinnedKey);
-  if (prev && t) {
-    setGlow(prev, false);
-    // gör den non-permanent igen
-    bindTooltip(prev, t, colorForProduct(t.product), false);
-    prev.closeTooltip();
+  if (pinnedLabelMarker) {
+    map.removeLayer(pinnedLabelMarker);
+    pinnedLabelMarker = null;
   }
   pinnedKey = null;
 }
 
-function pinMarker(key) {
-  if (pinnedKey === key) return; // redan pinnad
-
-  // släpp tidigare direkt
-  unpinCurrent();
-
-  const marker = markers.get(key);
+function showHoverLabelForKey(key) {
+  if (!key) return;
   const t = trainDataByKey.get(key);
-  if (!marker || !t) return;
+  const m = markers.get(key);
+  if (!t || !m) return;
+  showHoverLabel(key, t, m.getLatLng());
+}
+
+function showHoverLabel(key, t, pos) {
+  // Visa inte hover om samma tåg är pinnat
+  if (pinnedKey === key) return;
+
+  // Om vi hoverar en annan: ta bort gamla
+  if (hoverKey && hoverKey !== key) {
+    clearHoverLabel();
+  }
+
+  hoverKey = key;
+  const color = colorForProduct(t.product);
+  const icon = makeLabelDivIcon(t, color, false);
+
+  if (!hoverLabelMarker) {
+    hoverLabelMarker = L.marker(pos, {
+      icon,
+      interactive: false,
+      zIndexOffset: 2000,
+      keyboard: false,
+    }).addTo(map);
+  } else {
+    hoverLabelMarker.setLatLng(pos);
+    hoverLabelMarker.setIcon(icon);
+  }
+}
+
+function hideHoverLabel(key) {
+  if (hoverKey !== key) return;
+  if (pinnedKey === key) return; // aldrig hide om pinnad
+  clearHoverLabel();
+}
+
+function togglePinnedLabel(key, t, pos) {
+  // rensa hover direkt (som i SL)
+  clearHoverLabel();
+  isPointerOverTrain = false;
+
+  // toggla av
+  if (pinnedKey === key) {
+    clearPinnedLabel();
+    return;
+  }
+
+  // annars: släpp tidigare pin
+  clearPinnedLabel();
 
   pinnedKey = key;
-  setGlow(marker, true);
+  const color = colorForProduct(t.product);
+  const icon = makeLabelDivIcon(t, color, true);
 
-  // gör tooltip permanent direkt (känns “instant”)
-  bindTooltip(marker, t, colorForProduct(t.product), true);
-  marker.openTooltip();
+  setGlow(markers.get(key), true);
+
+  pinnedLabelMarker = L.marker(pos, {
+    icon,
+    interactive: false,
+    zIndexOffset: 2500,
+    keyboard: false,
+  }).addTo(map);
+}
+
+function syncLabelToMarker(key, markerLatLng) {
+  // Flytta labeln (billigt) under animation
+  if (hoverKey === key && hoverLabelMarker && pinnedKey !== key) {
+    hoverLabelMarker.setLatLng(markerLatLng);
+  }
+  if (pinnedKey === key && pinnedLabelMarker) {
+    pinnedLabelMarker.setLatLng(markerLatLng);
+  }
+}
+
+function syncLabelIconIfNeeded(key, t) {
+  // Byt icon (dyrare än setLatLng) – vi gör det bara vid refresh/upsert, inte per frame.
+  const color = colorForProduct(t.product);
+
+  if (hoverKey === key && hoverLabelMarker && pinnedKey !== key) {
+    hoverLabelMarker.setIcon(makeLabelDivIcon(t, color, false));
+  }
+  if (pinnedKey === key && pinnedLabelMarker) {
+    pinnedLabelMarker.setIcon(makeLabelDivIcon(t, color, true));
+  }
 }
 
 function attachHoverAndClick(marker, key) {
   marker.on("mouseover", () => {
-    // Man ska kunna hovera andra tåg även när något är pinnat
-    marker.openTooltip();
+    isPointerOverTrain = true;
+    const t = trainDataByKey.get(key);
+    if (!t) return;
+    showHoverLabel(key, t, marker.getLatLng());
   });
 
   marker.on("mouseout", () => {
-    // Stäng bara om den här inte är pinnad
-    if (pinnedKey !== key) marker.closeTooltip();
+    isPointerOverTrain = false;
+    hideHoverLabel(key);
   });
 
   marker.on("click", (e) => {
     L.DomEvent.stop(e);
-    pinMarker(key);
+    const t = trainDataByKey.get(key);
+    if (!t) return;
+    togglePinnedLabel(key, t, marker.getLatLng());
   });
+}
+
+// Släpp pin + hover på kartklick (snabbt)
+map.on("click", () => {
+  clearPinnedLabel();
+  clearHoverLabel();
+  isPointerOverTrain = false;
+});
+
+// Extra “säkring” som i SL: om musen lämnar tåg utan att out triggar perfekt
+map.on("mousemove", () => {
+  if (!isPointerOverTrain && hoverKey && hoverLabelMarker && pinnedKey !== hoverKey) {
+    clearHoverLabel();
+  }
+});
+
+// ===== Smooth move =====
+function lerp(a, b, t) {
+  return a + (b - a) * t;
+}
+
+// Nu tar vi med key så label kan följa under animation
+function animateMarkerTo(key, marker, toLatLng, durationMs = 850) {
+  const from = marker.getLatLng();
+  const to = L.latLng(toLatLng[0], toLatLng[1]);
+  const start = performance.now();
+
+  function step(now) {
+    const tt = Math.min(1, (now - start) / durationMs);
+    const ll = L.latLng(lerp(from.lat, to.lat, tt), lerp(from.lng, to.lng, tt));
+    marker.setLatLng(ll);
+
+    // håll labeln i sync utan tooltip-system
+    syncLabelToMarker(key, ll);
+
+    if (tt < 1) requestAnimationFrame(step);
+  }
+  requestAnimationFrame(step);
 }
 
 // ===== DATA-NORMALISERING =====
@@ -396,11 +562,10 @@ function estimateSpeedFromSamples(key, product, current) {
   const distKm = haversineKm(base.lat, base.lon, current.lat, current.lon);
   if (!Number.isFinite(distKm) || distKm < MIN_EST_DIST_KM) return null;
 
-  const est = (distKm / (dtMs / 3_600_000));
+  const est = distKm / (dtMs / 3_600_000);
   if (!Number.isFinite(est) || est < 2) return null;
 
   const max = maxPlausibleSpeed(product);
-  // om den är helt orimlig (ofta pga GPS-jitter), underkänn
   if (est > max * 1.35) return null;
 
   return Math.min(est, max);
@@ -408,8 +573,7 @@ function estimateSpeedFromSamples(key, product, current) {
 
 function smoothEstimate(key, rawEst, tsMs) {
   const prev = lastEstSpeedByKey.get(key);
-  if (prev && Number.isFinite(prev.speed) && (tsMs - prev.tsMs) <= REUSE_EST_MS) {
-    // EMA-ish: behåll lite av tidigare för stabilitet
+  if (prev && Number.isFinite(prev.speed) && tsMs - prev.tsMs <= REUSE_EST_MS) {
     return 0.65 * prev.speed + 0.35 * rawEst;
   }
   return rawEst;
@@ -450,9 +614,8 @@ function normalizeTrain(tIn) {
         t._speedEstimated = true;
         lastEstSpeedByKey.set(key, { speed: t.speed, tsMs });
       } else {
-        // saknar bra underlag just nu -> återanvänd senaste rimliga estimat
         const prev = lastEstSpeedByKey.get(key);
-        if (prev && Number.isFinite(prev.speed) && (tsMs - prev.tsMs) <= REUSE_EST_MS) {
+        if (prev && Number.isFinite(prev.speed) && tsMs - prev.tsMs <= REUSE_EST_MS) {
           t.speed = prev.speed;
           t._speedEstimated = true;
         }
@@ -488,28 +651,24 @@ function upsertTrain(t) {
       opacity,
     }).addTo(map);
 
-    // init tooltip non-permanent
-    bindTooltip(marker, t, color, false);
     attachHoverAndClick(marker, key);
-
     markers.set(key, marker);
   } else {
     const marker = markers.get(key);
 
-    // position animation
-    animateMarkerTo(marker, [t.lat, t.lon], 850);
+    // position animation (inkl label sync under animation)
+    animateMarkerTo(key, marker, [t.lat, t.lon], 850);
 
-    // icon update (bearing + color) — sker bara vid refresh, inte vid click
+    // icon update (bearing + color)
     marker.setIcon(makeTrainDivIcon({ color, bearing: t.bearing }));
     marker.setOpacity(opacity);
 
-    // Uppdatera tooltip-content utan att re-binda (minskar lagg rejält)
-    updateTooltipContent(marker, t, color);
+    // Om labeln är aktiv: uppdatera icon-text vid refresh (inte per frame)
+    syncLabelIconIfNeeded(key, t);
 
-    const isPinned = pinnedKey === key;
-    if (isPinned) {
+    // Se till att glow är kvar om pinnad
+    if (pinnedKey === key) {
       setGlow(marker, true);
-      marker.openTooltip();
     }
   }
 
@@ -533,7 +692,9 @@ async function refresh() {
     // remove gamla
     for (const [key, marker] of markers.entries()) {
       if (!seen.has(key)) {
-        if (pinnedKey === key) pinnedKey = null;
+        if (pinnedKey === key) clearPinnedLabel();
+        if (hoverKey === key) clearHoverLabel();
+
         if (map.hasLayer(marker)) map.removeLayer(marker);
         markers.delete(key);
         trainDataByKey.delete(key);
@@ -549,7 +710,6 @@ async function refresh() {
 }
 
 // ===== SCHEDULER =====
-// Undvik overlap + uppdatera inte när fliken är dold
 let refreshTimer = null;
 async function tick() {
   await refresh();
@@ -558,7 +718,6 @@ async function tick() {
 
 document.addEventListener("visibilitychange", () => {
   if (!document.hidden) {
-    // Direkt refresh när man kommer tillbaka
     refresh();
   }
 });
