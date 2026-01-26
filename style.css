@@ -162,6 +162,15 @@ body {
   object-fit: contain;
 }
 
+/* Positionera labeln rakt ovanför markercentrum */
+.trainLabelPos {
+  position: relative;
+  transform: translate(-50%, calc(-100% - 18px));
+  transform-origin: 0 0;
+  display: inline-block;
+  pointer-events: none;
+}
+
 /* --- User location  --- */
 .userLocDot {
   width: 14px;
