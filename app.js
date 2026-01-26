@@ -1,5 +1,5 @@
 const WORKER_URL = "https://trains.etfnordic.workers.dev/trains";
-const REFRESH_MS = 5000;
+const REFRESH_MS = 2500;
 
 const PRODUCT_COLORS = {
   "Pågatågen": "#A855F7",
@@ -35,48 +35,55 @@ L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
     'Tiles style by <a href="https://www.hotosm.org/">Humanitarian OpenStreetMap Team</a>',
 }).addTo(map);
 
-// GPS-position
+// =========================
+// USER GEOLOCATION (Google Maps style)
+// =========================
 let userMarker = null;
 let userAccuracyCircle = null;
 let userWatchId = null;
-let followUser = false; // true för att följa
+let followUser = false;
 
 function makeUserIcon() {
   return L.divIcon({
     className: "userLocWrap",
-    html: `<div class="userLocDot"></div>`,
+    html: `<div class="userLocDot"><div class="userLocPulse"></div></div>`,
     iconSize: [20, 20],
     iconAnchor: [10, 10],
   });
 }
 
-function startUserLocation() {
+function ensureUserLocation() {
+  if (userWatchId !== null) return; // redan igång
   if (!("geolocation" in navigator)) {
     console.warn("Geolocation stöds inte i den här webbläsaren.");
     return;
   }
 
-  // Starta live-uppdatering
   userWatchId = navigator.geolocation.watchPosition(
     (pos) => {
       const { latitude, longitude, accuracy } = pos.coords;
       const latlng = [latitude, longitude];
+      const acc = Math.max(Number(accuracy || 0), 10);
 
       if (!userMarker) {
-        userMarker = L.marker(latlng, { icon: makeUserIcon(), zIndexOffset: 3000 })
-          .addTo(map)
-          .bindPopup("Din position");
+        userMarker = L.marker(latlng, {
+          icon: makeUserIcon(),
+          zIndexOffset: 4000,
+          keyboard: false,
+        }).addTo(map);
 
         userAccuracyCircle = L.circle(latlng, {
-          radius: Math.max(accuracy || 0, 10),
+          radius: acc,
           weight: 1,
-          opacity: 0.4,
-          fillOpacity: 0.12,
+          color: "rgba(26,115,232,0.45)",
+          fillColor: "rgba(26,115,232,0.25)",
+          fillOpacity: 1,
+          opacity: 1,
         }).addTo(map);
       } else {
         userMarker.setLatLng(latlng);
         userAccuracyCircle.setLatLng(latlng);
-        userAccuracyCircle.setRadius(Math.max(accuracy || 0, 10));
+        userAccuracyCircle.setRadius(acc);
       }
 
       if (followUser) {
@@ -85,14 +92,69 @@ function startUserLocation() {
     },
     (err) => {
       console.warn("GPS-fel:", err?.message || err);
+      // Om permission nekas osv – lämna knappen så användaren kan försöka igen.
     },
     {
       enableHighAccuracy: true,
       maximumAge: 1500,
       timeout: 10000,
-    }
+    },
   );
 }
+
+// En “Google Maps”-liknande locate-knapp (user gesture hjälper i många browsers)
+const LocateControl = L.Control.extend({
+  options: { position: "bottomright" },
+  onAdd() {
+    const btn = L.DomUtil.create("button", "locateBtn");
+    btn.type = "button";
+    btn.title = "Visa min position";
+    btn.innerHTML = "⌖";
+
+    L.DomEvent.disableClickPropagation(btn);
+    L.DomEvent.on(btn, "click", (e) => {
+      L.DomEvent.stop(e);
+
+      ensureUserLocation();
+      followUser = true;
+
+      if (userMarker) {
+        const ll = userMarker.getLatLng();
+        map.setView(ll, Math.max(map.getZoom(), 14), { animate: true });
+      } else {
+        // Om vi inte har en fix ännu: försök med getCurrentPosition för snabb första fix
+        if ("geolocation" in navigator) {
+          navigator.geolocation.getCurrentPosition(
+            (pos) => {
+              const ll = [pos.coords.latitude, pos.coords.longitude];
+              map.setView(ll, Math.max(map.getZoom(), 14), { animate: true });
+            },
+            () => {},
+            { enableHighAccuracy: true, timeout: 8000, maximumAge: 0 },
+          );
+        }
+      }
+
+      // Visuell state
+      btn.classList.add("is-following");
+    });
+
+    // Sluta följa om användaren själv rör kartan (Google Maps-beteende)
+    const stopFollow = () => {
+      if (!followUser) return;
+      followUser = false;
+      btn.classList.remove("is-following");
+    };
+    map.on("dragstart", stopFollow);
+    map.on("zoomstart", stopFollow);
+
+    return btn;
+  },
+});
+map.addControl(new LocateControl());
+
+// Försök starta direkt också (funkar fint på GitHub Pages/HTTPS)
+ensureUserLocation();
 
 // ===== STATE =====
 const markers = new Map(); // key -> marker
@@ -107,14 +169,11 @@ let pinnedLabelMarker = null;
 
 let isPointerOverTrain = false;
 
-// Justera om chip sitter för nära/för långt: (px uppåt)
 const LABEL_OFFSET_Y_PX = 18;
 
-// För hastighetsestimat (när worker skickar null / pendel-"1")
-// key -> [{ lat, lon, tsMs }, ...] (senaste sist)
-const lastSamplesByKey = new Map();
-// key -> { speed, tsMs } (senaste estimerade/smoothede hastighet)
-const lastEstSpeedByKey = new Map();
+// För hastighetsestimat
+const lastSamplesByKey = new Map(); // key -> [{ lat, lon, tsMs }, ...]
+const lastEstSpeedByKey = new Map(); // key -> { speed, tsMs }
 
 let filterQuery = "";
 let userInteractedSinceSearch = false;
@@ -129,13 +188,11 @@ function normalize(s) {
 
 function matchesFilter(t) {
   if (!filterQuery) return true;
-  // Endast tågnummer + product
   const hay = `${t.trainNo} ${t.product}`.toLowerCase();
   return hay.includes(filterQuery);
 }
 
 function applyFilterAndMaybeZoom() {
-  // 1) visa/dölj markers
   let matchKeys = [];
   for (const [key, marker] of markers.entries()) {
     const t = trainDataByKey.get(key);
@@ -146,22 +203,17 @@ function applyFilterAndMaybeZoom() {
       matchKeys.push(key);
     } else {
       if (map.hasLayer(marker)) map.removeLayer(marker);
-
-      // om ett dolt tåg var pinnat/hoverat -> släpp
       if (pinnedKey === key) clearPinnedLabel();
       if (hoverKey === key) clearHoverLabel();
     }
   }
 
-  // 2) auto-zoom om exakt 1 match
   if (filterQuery && matchKeys.length === 1 && !userInteractedSinceSearch) {
     const key = matchKeys[0];
     const marker = markers.get(key);
     if (marker) {
       const ll = marker.getLatLng();
       map.setView(ll, Math.max(map.getZoom(), 10), { animate: true });
-
-      // visa label även om inget är pinnat
       showHoverLabelForKey(key);
     }
   }
@@ -192,7 +244,6 @@ clearBtn.addEventListener("click", () => {
   searchEl.focus();
 });
 
-// Om användaren panorerar/zoomar efter en sökning ska vi inte "dra tillbaka" kameran
 map.on("dragstart", () => {
   userInteractedSinceSearch = true;
 });
@@ -209,15 +260,10 @@ function hexToRgb(hex) {
   const h = String(hex ?? "").trim();
   const m = /^#?([a-f\d]{2})([a-f\d]{2})([a-f\d]{2})$/i.exec(h);
   if (!m) return null;
-  return {
-    r: parseInt(m[1], 16),
-    g: parseInt(m[2], 16),
-    b: parseInt(m[3], 16),
-  };
+  return { r: parseInt(m[1], 16), g: parseInt(m[2], 16), b: parseInt(m[3], 16) };
 }
 
 function bestTextColor(bgHex) {
-  // WCAG-ish luminans (0..1)
   const rgb = hexToRgb(bgHex);
   if (!rgb) return "#fff";
   const srgb = [rgb.r, rgb.g, rgb.b].map((v) => {
@@ -228,7 +274,7 @@ function bestTextColor(bgHex) {
   return L > 0.55 ? "#0B1220" : "#ffffff";
 }
 
-// Bearing offset: “mittemellan” = -45
+// Bearing offset
 const BEARING_OFFSET_DEG = -45;
 
 function makeTrainDivIcon({ color, bearing }) {
@@ -246,7 +292,6 @@ function makeTrainDivIcon({ color, bearing }) {
   });
 }
 
-// Fylld pil
 function makeArrowSvg(color) {
   return `
     <svg viewBox="0 0 24 24" aria-hidden="true">
@@ -263,7 +308,6 @@ function formatChipText(t) {
   return `${base} \u00B7 ${prefix}${t.speed} km/h`;
 }
 
-// logos: baserat på product
 function safeFileName(s) {
   return String(s ?? "")
     .toLowerCase()
@@ -292,7 +336,7 @@ function chipHtml(t, color) {
 // ===== Label icon (SL-style) =====
 function makeLabelDivIcon(t, color, pinned) {
   const wrapper = `
-    <div class="trainLabelPos">
+    <div class="trainLabelPos" style="--label-gap:${LABEL_OFFSET_Y_PX}px;">
       ${chipHtml(t, color)}
     </div>
   `;
@@ -300,9 +344,7 @@ function makeLabelDivIcon(t, color, pinned) {
   return L.divIcon({
     className: pinned ? "train-chip pinned" : "train-chip",
     html: wrapper,
-    // Leaflet behöver en "låtsas-storlek" för att kunna ankra snyggt.
     iconSize: [1, 1],
-    // Ankaret i mitten av "punkten" -> då hamnar labeln rakt över tåget
     iconAnchor: [0.5, 0.5],
   });
 }
@@ -326,7 +368,6 @@ function clearPinnedLabel() {
     const m = markers.get(pinnedKey);
     if (m) setGlow(m, false);
   }
-
   if (pinnedLabelMarker) {
     map.removeLayer(pinnedLabelMarker);
     pinnedLabelMarker = null;
@@ -343,13 +384,9 @@ function showHoverLabelForKey(key) {
 }
 
 function showHoverLabel(key, t, pos) {
-  // Visa inte hover om samma tåg är pinnat
   if (pinnedKey === key) return;
 
-  // Om vi hoverar en annan: ta bort gamla
-  if (hoverKey && hoverKey !== key) {
-    clearHoverLabel();
-  }
+  if (hoverKey && hoverKey !== key) clearHoverLabel();
 
   hoverKey = key;
   const color = colorForProduct(t.product);
@@ -370,22 +407,19 @@ function showHoverLabel(key, t, pos) {
 
 function hideHoverLabel(key) {
   if (hoverKey !== key) return;
-  if (pinnedKey === key) return; // aldrig hide om pinnad
+  if (pinnedKey === key) return;
   clearHoverLabel();
 }
 
 function togglePinnedLabel(key, t, pos) {
-  // rensa hover direkt (som i SL)
   clearHoverLabel();
   isPointerOverTrain = false;
 
-  // toggla av
   if (pinnedKey === key) {
     clearPinnedLabel();
     return;
   }
 
-  // annars: släpp tidigare pin
   clearPinnedLabel();
 
   pinnedKey = key;
@@ -403,7 +437,6 @@ function togglePinnedLabel(key, t, pos) {
 }
 
 function syncLabelToMarker(key, markerLatLng) {
-  // Flytta labeln (billigt) under animation
   if (hoverKey === key && hoverLabelMarker && pinnedKey !== key) {
     hoverLabelMarker.setLatLng(markerLatLng);
   }
@@ -413,9 +446,7 @@ function syncLabelToMarker(key, markerLatLng) {
 }
 
 function syncLabelIconIfNeeded(key, t) {
-  // Byt icon (dyrare än setLatLng) – vi gör det bara vid refresh/upsert, inte per frame.
   const color = colorForProduct(t.product);
-
   if (hoverKey === key && hoverLabelMarker && pinnedKey !== key) {
     hoverLabelMarker.setIcon(makeLabelDivIcon(t, color, false));
   }
@@ -445,14 +476,12 @@ function attachHoverAndClick(marker, key) {
   });
 }
 
-// Släpp pin + hover på kartklick (snabbt)
 map.on("click", () => {
   clearPinnedLabel();
   clearHoverLabel();
   isPointerOverTrain = false;
 });
 
-// Extra “säkring” som i SL: om musen lämnar tåg utan att out triggar perfekt
 map.on("mousemove", () => {
   if (!isPointerOverTrain && hoverKey && hoverLabelMarker && pinnedKey !== hoverKey) {
     clearHoverLabel();
@@ -464,7 +493,6 @@ function lerp(a, b, t) {
   return a + (b - a) * t;
 }
 
-// Nu tar vi med key så label kan följa under animation
 function animateMarkerTo(key, marker, toLatLng, durationMs = 850) {
   const from = marker.getLatLng();
   const to = L.latLng(toLatLng[0], toLatLng[1]);
@@ -474,10 +502,7 @@ function animateMarkerTo(key, marker, toLatLng, durationMs = 850) {
     const tt = Math.min(1, (now - start) / durationMs);
     const ll = L.latLng(lerp(from.lat, to.lat, tt), lerp(from.lng, to.lng, tt));
     marker.setLatLng(ll);
-
-    // håll labeln i sync utan tooltip-system
     syncLabelToMarker(key, ll);
-
     if (tt < 1) requestAnimationFrame(step);
   }
   requestAnimationFrame(step);
@@ -501,80 +526,87 @@ function haversineKm(lat1, lon1, lat2, lon2) {
   return 2 * R * Math.asin(Math.sqrt(a));
 }
 
-const MAX_SAMPLES = 6;
-const MIN_EST_DT_MS = 15_000; // minst 15s för att minska jitter
-const MIN_EST_DIST_KM = 0.05; // ignorera små hopp
-const REUSE_EST_MS = 90_000; // återanvänd senaste est om vi saknar bra underlag
+// ===== BETTER SPEED ESTIMATION + CAP 205 =====
+const SPEED_CAP = 205;
 
-const MAX_SPEED_BY_PRODUCT = {
-  "SL Pendeltåg": 170,
-  "Pågatågen": 200,
-  "Västtågen": 200,
-  "Krösatågen": 180,
-  "Tåg i Bergslagen": 200,
-  "Värmlandstrafik": 200,
-  "Arlanda Express": 220,
-  "SJ InterCity": 200,
-  "X-Tåget": 200,
-  "Snälltåget": 230,
-  "Norrtåg": 200,
-};
-
-function maxPlausibleSpeed(product) {
-  return MAX_SPEED_BY_PRODUCT[product] ?? 250;
-}
+const MAX_SAMPLES = 10;          // lite fler så median blir stabil
+const WINDOW_MS = 90_000;        // analysera senaste 90s
+const MIN_SEG_DT_MS = 6_000;     // minst 6s mellan punkter
+const MIN_SEG_DIST_KM = 0.05;    // ignorera små hopp (brus)
+const REUSE_EST_MS = 90_000;     // återanvänd senaste est om vi saknar underlag
 
 function pushSample(key, sample) {
   const arr = lastSamplesByKey.get(key) ?? [];
   const last = arr[arr.length - 1];
 
-  // om timestamp är samma, ersätt senaste (minskar "fladder")
   if (last && last.tsMs === sample.tsMs) {
     arr[arr.length - 1] = sample;
   } else {
     arr.push(sample);
   }
 
-  // trim
+  // trim + rensa för gamla (över WINDOW_MS) men behåll lite slack
+  const newest = arr[arr.length - 1]?.tsMs ?? sample.tsMs;
+  const minTs = newest - (WINDOW_MS + 60_000);
+  while (arr.length > 0 && arr[0].tsMs < minTs) arr.shift();
   while (arr.length > MAX_SAMPLES) arr.shift();
+
   lastSamplesByKey.set(key, arr);
   return arr;
 }
 
-function estimateSpeedFromSamples(key, product, current) {
+function median(values) {
+  if (!values.length) return null;
+  const a = [...values].sort((x, y) => x - y);
+  const mid = Math.floor(a.length / 2);
+  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
+}
+
+// Bygger segmenthastigheter och tar median (robust mot outliers)
+function estimateSpeedFromSamples(key, current) {
   const arr = lastSamplesByKey.get(key);
-  if (!arr || arr.length < 2) return null;
+  if (!arr || arr.length < 3) return null;
+  if (!Number.isFinite(current.tsMs)) return null;
 
-  // hitta en sample som är minst MIN_EST_DT_MS äldre än current
-  const targetTs = current.tsMs - MIN_EST_DT_MS;
-  let base = null;
-  for (let i = arr.length - 2; i >= 0; i--) {
-    if (arr[i].tsMs <= targetTs) {
-      base = arr[i];
-      break;
-    }
+  const cutoff = current.tsMs - WINDOW_MS;
+
+  // välj samples inom fönster
+  const pts = arr.filter((s) => s.tsMs >= cutoff && s.tsMs <= current.tsMs);
+  if (pts.length < 3) return null;
+
+  const speeds = [];
+  for (let i = 1; i < pts.length; i++) {
+    const a = pts[i - 1];
+    const b = pts[i];
+    const dt = b.tsMs - a.tsMs;
+    if (dt < MIN_SEG_DT_MS) continue;
+
+    const dist = haversineKm(a.lat, a.lon, b.lat, b.lon);
+    if (!Number.isFinite(dist) || dist < MIN_SEG_DIST_KM) continue;
+
+    const v = dist / (dt / 3_600_000);
+    if (!Number.isFinite(v) || v < 2) continue;
+
+    speeds.push(Math.min(v, SPEED_CAP));
   }
-  if (!base) return null;
 
-  const dtMs = current.tsMs - base.tsMs;
-  if (dtMs <= 0) return null;
+  if (speeds.length < 2) return null;
 
-  const distKm = haversineKm(base.lat, base.lon, current.lat, current.lon);
-  if (!Number.isFinite(distKm) || distKm < MIN_EST_DIST_KM) return null;
+  // extra outlier-trim: ta bort topp 10% om många punkter
+  speeds.sort((x, y) => x - y);
+  if (speeds.length >= 6) {
+    const cut = Math.floor(speeds.length * 0.9);
+    speeds.length = Math.max(2, cut);
+  }
 
-  const est = distKm / (dtMs / 3_600_000);
-  if (!Number.isFinite(est) || est < 2) return null;
-
-  const max = maxPlausibleSpeed(product);
-  if (est > max * 1.35) return null;
-
-  return Math.min(est, max);
+  return median(speeds);
 }
 
 function smoothEstimate(key, rawEst, tsMs) {
   const prev = lastEstSpeedByKey.get(key);
   if (prev && Number.isFinite(prev.speed) && tsMs - prev.tsMs <= REUSE_EST_MS) {
-    return 0.65 * prev.speed + 0.35 * rawEst;
+    // lite mindre “drag” än innan (snabbare att följa verkligheten)
+    return 0.55 * prev.speed + 0.45 * rawEst;
   }
   return rawEst;
 }
@@ -582,41 +614,45 @@ function smoothEstimate(key, rawEst, tsMs) {
 function normalizeTrain(tIn) {
   const t = { ...tIn };
 
-  // Product-display
   t.product = normalizeProduct(t.product);
 
-  // Arlanda Express-regel
   const n = Number(t.trainNo);
   if (Number.isFinite(n) && n >= 7700 && n <= 7999) {
     t.product = "Arlanda Express";
     t.to = n % 2 === 1 ? "Stockholm C" : "Arlanda";
   }
 
-  // SL Pendeltåg: "1 km/h" verkar vara default -> behandla som null
+  // SL Pendeltåg: "1 km/h" default -> behandla som null
   if (t.product === "SL Pendeltåg" && t.speed === 1) {
     t.speed = null;
   }
 
   const key = `${t.depDate}_${t.trainNo}`;
   const tsMs = Date.parse(t.timeStamp ?? "");
+
   if (Number.isFinite(tsMs) && typeof t.lat === "number" && typeof t.lon === "number") {
     pushSample(key, { lat: t.lat, lon: t.lon, tsMs });
   }
 
-  // Hastighetsestimat om null
+  // clamp även “riktig” speed (så du aldrig visar >205)
+  if (t.speed !== null && t.speed !== undefined && Number.isFinite(Number(t.speed))) {
+    t.speed = Math.min(Number(t.speed), SPEED_CAP);
+  }
+
+  // Estimera om null
   t._speedEstimated = false;
   if (t.speed === null || t.speed === undefined) {
     if (Number.isFinite(tsMs)) {
-      const raw = estimateSpeedFromSamples(key, t.product, { lat: t.lat, lon: t.lon, tsMs });
+      const raw = estimateSpeedFromSamples(key, { lat: t.lat, lon: t.lon, tsMs });
       if (raw !== null) {
         const smoothed = smoothEstimate(key, raw, tsMs);
-        t.speed = Math.round(smoothed);
+        t.speed = Math.min(SPEED_CAP, Math.round(smoothed));
         t._speedEstimated = true;
         lastEstSpeedByKey.set(key, { speed: t.speed, tsMs });
       } else {
         const prev = lastEstSpeedByKey.get(key);
         if (prev && Number.isFinite(prev.speed) && tsMs - prev.tsMs <= REUSE_EST_MS) {
-          t.speed = prev.speed;
+          t.speed = Math.min(SPEED_CAP, prev.speed);
           t._speedEstimated = true;
         }
       }
@@ -656,20 +692,14 @@ function upsertTrain(t) {
   } else {
     const marker = markers.get(key);
 
-    // position animation (inkl label sync under animation)
     animateMarkerTo(key, marker, [t.lat, t.lon], 850);
 
-    // icon update (bearing + color)
     marker.setIcon(makeTrainDivIcon({ color, bearing: t.bearing }));
     marker.setOpacity(opacity);
 
-    // Om labeln är aktiv: uppdatera icon-text vid refresh (inte per frame)
     syncLabelIconIfNeeded(key, t);
 
-    // Se till att glow är kvar om pinnad
-    if (pinnedKey === key) {
-      setGlow(marker, true);
-    }
+    if (pinnedKey === key) setGlow(marker, true);
   }
 
   return key;
@@ -678,7 +708,7 @@ function upsertTrain(t) {
 // ===== LOOP =====
 async function refresh() {
   try {
-    if (document.hidden) return; // spara CPU + data när fliken inte är aktiv
+    if (document.hidden) return;
     const trains = await fetchTrains();
     const seen = new Set();
 
@@ -689,7 +719,6 @@ async function refresh() {
       seen.add(key);
     }
 
-    // remove gamla
     for (const [key, marker] of markers.entries()) {
       if (!seen.has(key)) {
         if (pinnedKey === key) clearPinnedLabel();
@@ -717,9 +746,7 @@ async function tick() {
 }
 
 document.addEventListener("visibilitychange", () => {
-  if (!document.hidden) {
-    refresh();
-  }
+  if (!document.hidden) refresh();
 });
 
 tick();
