@@ -37,7 +37,7 @@ L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
 }).addTo(map);
 
 // =========================
-// USER GEOLOCATION (Google Maps style)
+// USER GEOLOCATION (Google Maps style) 
 // =========================
 let userMarker = null;
 let userAccuracyCircle = null;
