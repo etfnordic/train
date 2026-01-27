@@ -4,7 +4,7 @@ const REFRESH_MS = 2500;
 const PRODUCT_COLORS = {
   "Pågatågen": "#6460AD",
   "Västtågen": "#007EB1",
-  "Krösatågen": "#FCC907",
+  "Krösatågen": "#FCF807",
   "Tåg i Bergslagen": "#851401",
   "Värmlandstrafik": "#F9B000",
   "Arlanda Express": "#FEF380",
