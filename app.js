@@ -19,7 +19,7 @@ const PRODUCT_COLORS = {
   "Snälltåget": "#D13634",
   "SL Pendeltåg": "#00A3E0",
   "Norrtåg": "#F43F5E",
-  "Östgötapendeln": "#ED1B24",
+  "Östgötapendel": "#ED1B24",
   "Tågab": "#0EA5E9",
   "Öresundståg": "#494949",
   "VR Snabbtåg": "#0EA5E9",
