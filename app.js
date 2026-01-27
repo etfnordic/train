@@ -1,6 +1,9 @@
 const WORKER_URL = "https://trains.etfnordic.workers.dev/trains";
 const REFRESH_MS = 2500;
 
+// Visuellt: dimma inställda tåg (sätt true om du vill ha 0.35 igen)
+const SHOW_CANCELED_DIM = false;
+
 const PRODUCT_COLORS = {
   "Pågatågen": "#6460AD",
   "Västtågen": "#007EB1",
@@ -37,7 +40,7 @@ L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
 }).addTo(map);
 
 // =========================
-// USER GEOLOCATION (Google Maps style) 
+// USER GEOLOCATION (Google Maps style)
 // =========================
 let userMarker = null;
 let userAccuracyCircle = null;
@@ -176,6 +179,25 @@ const LABEL_OFFSET_Y_PX = 18;
 const lastSamplesByKey = new Map(); // key -> [{ lat, lon, tsMs }, ...]
 const lastEstSpeedByKey = new Map(); // key -> { speed, tsMs }
 
+// Cache: senaste kända product/to per tågnr (för att undvika null-flimmer)
+const lastKnownByTrainNo = new Map(); // trainNo -> { product, to, tsMs }
+const LAST_KNOWN_TTL_MS = 30 * 60 * 1000; // 30 min
+
+function isMissing(v) {
+  return v === null || v === undefined || v === "" || v === "null";
+}
+
+function cleanupLastKnownCache(activeTrainNos) {
+  const now = Date.now();
+  const active = activeTrainNos instanceof Set ? activeTrainNos : new Set(activeTrainNos);
+
+  for (const [trainNo, cached] of lastKnownByTrainNo.entries()) {
+    const expired = !cached || (now - (cached.tsMs ?? 0)) > LAST_KNOWN_TTL_MS;
+    const missing = !active.has(trainNo);
+    if (expired || missing) lastKnownByTrainNo.delete(trainNo);
+  }
+}
+
 let filterQuery = "";
 let userInteractedSinceSearch = false;
 
@@ -303,10 +325,25 @@ function makeArrowSvg(color) {
 }
 
 function formatChipText(t) {
-  const base = `${t.product} ${t.trainNo} \u2192 ${t.to}`;
+  const trainNo = String(t.trainNo ?? "").trim();
+
+  const hasProduct = !isMissing(t.product);
+  const hasTo = !isMissing(t.to);
+
+  let base = "";
+  if (!hasProduct && !hasTo) {
+    base = `${trainNo}`;
+  } else if (hasProduct && hasTo) {
+    base = `${t.product} ${trainNo} → ${t.to}`;
+  } else if (hasProduct) {
+    base = `${t.product} ${trainNo}`;
+  } else {
+    base = `${trainNo} → ${t.to}`;
+  }
+
   if (t.speed === null || t.speed === undefined) return base;
   const prefix = t._speedEstimated ? "~" : "";
-  return `${base} \u00B7 ${prefix}${t.speed} km/h`;
+  return `${base} · ${prefix}${t.speed} km/h`;
 }
 
 function safeFileName(s) {
@@ -530,11 +567,11 @@ function haversineKm(lat1, lon1, lat2, lon2) {
 // ===== BETTER SPEED ESTIMATION + CAP 205 =====
 const SPEED_CAP = 205;
 
-const MAX_SAMPLES = 10;          // lite fler så median blir stabil
-const WINDOW_MS = 90_000;        // analysera senaste 90s
-const MIN_SEG_DT_MS = 6_000;     // minst 6s mellan punkter
-const MIN_SEG_DIST_KM = 0.05;    // ignorera små hopp (brus)
-const REUSE_EST_MS = 90_000;     // återanvänd senaste est om vi saknar underlag
+const MAX_SAMPLES = 10; // lite fler så median blir stabil
+const WINDOW_MS = 90_000; // analysera senaste 90s
+const MIN_SEG_DT_MS = 6_000; // minst 6s mellan punkter
+const MIN_SEG_DIST_KM = 0.05; // ignorera små hopp (brus)
+const REUSE_EST_MS = 90_000; // återanvänd senaste est om vi saknar underlag
 
 function pushSample(key, sample) {
   const arr = lastSamplesByKey.get(key) ?? [];
@@ -628,6 +665,34 @@ function normalizeTrain(tIn) {
     t.speed = null;
   }
 
+  // Snygga upp "null" (kan komma och gå från API)
+  if (isMissing(t.product)) t.product = null;
+  if (isMissing(t.to)) t.to = null;
+
+  // Fyll i från senaste kända om fält går till null
+  const trainNoKey = String(t.trainNo ?? "");
+  const now = Date.now();
+  if (trainNoKey) {
+    const cached = lastKnownByTrainNo.get(trainNoKey);
+
+    const gotProduct = !isMissing(t.product);
+    const gotTo = !isMissing(t.to);
+
+    if (gotProduct || gotTo) {
+      lastKnownByTrainNo.set(trainNoKey, {
+        product: gotProduct ? t.product : (cached?.product ?? null),
+        to: gotTo ? t.to : (cached?.to ?? null),
+        tsMs: now,
+      });
+    }
+
+    const fresh = cached && (now - (cached.tsMs ?? 0) < LAST_KNOWN_TTL_MS);
+    if (fresh) {
+      if (!gotProduct) t.product = cached.product;
+      if (!gotTo) t.to = cached.to;
+    }
+  }
+
   const key = `${t.depDate}_${t.trainNo}`;
   const tsMs = Date.parse(t.timeStamp ?? "");
 
@@ -680,7 +745,7 @@ function upsertTrain(t) {
   trainDataByKey.set(key, t);
 
   const color = colorForProduct(t.product);
-  const opacity = t.canceled ? 0.35 : 1;
+  const opacity = (SHOW_CANCELED_DIM && t.canceled) ? 0.35 : 1;
 
   if (!markers.has(key)) {
     const marker = L.marker([t.lat, t.lon], {
@@ -712,13 +777,17 @@ async function refresh() {
     if (document.hidden) return;
     const trains = await fetchTrains();
     const seen = new Set();
+    const seenTrainNos = new Set();
 
     for (const t of trains) {
       if (!t || !t.trainNo) continue;
       if (typeof t.lat !== "number" || typeof t.lon !== "number") continue;
       const key = upsertTrain(t);
       seen.add(key);
+      seenTrainNos.add(String(t.trainNo));
     }
+
+    cleanupLastKnownCache(seenTrainNos);
 
     for (const [key, marker] of markers.entries()) {
       if (!seen.has(key)) {
