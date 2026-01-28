@@ -6,6 +6,7 @@ const SHOW_CANCELED_DIM = false;
 
 const PRODUCT_COLORS = {
   "Pågatågen": "#6460AD",
+  "Pågatågen Exp": "#6460AD",
   "Västtågen": "#007EB1",
   "Krösatågen": "#FCF807",
   "Tåg i Bergslagen": "#851401",
