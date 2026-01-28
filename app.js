@@ -711,19 +711,15 @@ function estimateSpeedWithBearingAlphaBeta(key, lat, lon, bearingDeg, tsMs) {
   // Along-track (projektion längs bearing) -> mindre sidjitter
   let along = dx * ux + dy * uy;
 
-  // Om bearing och verklig rörelse pekar "bakåt" kan along bli negativ (kurvor/jitter).
-  // För speed vill vi inte få negativa spike: clampa upp till 0 om svagt negativt.
-  if (along < 0) {
-    // tillåt inte att små fel drar ner speed:
-    if (Math.abs(along) < 0.25 * distM) along = 0;
-  }
+  // FIX 1: hård clamp för att undvika "bakåthopp" => speed studs
+  if (along < 0) along = 0;
 
   const instMps = along / dt;
   const instKmh = instMps * 3.6;
 
   // Outlier gates
   const MAX_KMH_GATE = 350; // gate (display cap är 200)
-  const MIN_DIST_M = 6; // mindre än detta är ofta brus vid korta dt
+  const MIN_DIST_M = 12; // FIX 2: ignorera små hopp (brus) mer aggressivt
   const ok = instKmh >= 0 && instKmh <= MAX_KMH_GATE && (distM >= MIN_DIST_M || dt >= 8);
 
   // Uppdatera last oavsett, så vi inte “fastnar”
@@ -733,12 +729,22 @@ function estimateSpeedWithBearingAlphaBeta(key, lat, lon, bearingDeg, tsMs) {
 
   if (!ok) return null;
 
-  // 1D alpha-beta filter på speed (m/s) + acceleration (m/s^2)
-  // Snabb respons men stabilt
-  const alpha = 0.45;
-  const beta = 0.12;
-
+  // FIX 3: adaptiv alpha/beta (stabil vid låg fart, snabbare vid hög)
   const vPred = st.vMps + st.aMps2 * dt;
+  const vKmhPred = Math.max(0, vPred * 3.6);
+
+  let alpha, beta;
+  if (vKmhPred < 30) {
+    alpha = 0.18;
+    beta = 0.03;
+  } else if (vKmhPred < 90) {
+    alpha = 0.25;
+    beta = 0.05;
+  } else {
+    alpha = 0.32;
+    beta = 0.07;
+  }
+
   const r = instMps - vPred;
 
   st.vMps = vPred + alpha * r;
