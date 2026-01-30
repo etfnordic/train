@@ -48,7 +48,7 @@ map.getPane("railsPane").style.zIndex = 350;
 L.tileLayer("https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png", {
   maxZoom: 19,
   pane: "railsPane",
-  opacity: 0.7,
+  opacity: 0.4,
   attribution: "&copy; OpenRailwayMap (OSM-baserat)",
 }).addTo(map);
 
