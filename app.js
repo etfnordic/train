@@ -33,11 +33,23 @@ const DEFAULT_COLOR = "#FFFFFF";
 
 // ===== KARTA =====
 const map = L.map("map", { zoomControl: true }).setView([59.33, 18.06], 6);
-L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
+const baseHot = L.tileLayer("https://{s}.tile.openstreetmap.fr/hot/{z}/{x}/{y}.png", {
   maxZoom: 19,
   attribution:
     '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors, ' +
     'Tiles style by <a href="https://www.hotosm.org/">Humanitarian OpenStreetMap Team</a>',
+}).addTo(map);
+
+// ===== RAIL OVERLAY (OpenRailwayMap) =====
+// Lägg järnvägar under tågen (markers ligger över p.g.a. högre z-index)
+map.createPane("railsPane");
+map.getPane("railsPane").style.zIndex = 350;
+
+L.tileLayer("https://{s}.tiles.openrailwaymap.org/standard/{z}/{x}/{y}.png", {
+  maxZoom: 19,
+  pane: "railsPane",
+  opacity: 0.9,
+  attribution: "&copy; OpenRailwayMap (OSM-baserat)",
 }).addTo(map);
 
 // =========================
