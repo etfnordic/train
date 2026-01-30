@@ -176,13 +176,6 @@ let isPointerOverTrain = false;
 
 const LABEL_OFFSET_Y_PX = 18;
 
-// För hastighetsestimat
-const lastSamplesByKey = new Map(); // key -> [{ lat, lon, tsMs }, ...]
-const lastEstSpeedByKey = new Map(); // key -> { speed, tsMs }
-
-// Bearing-baserat speed state (alpha-beta) per tåg
-const speedStateByKey = new Map(); // key -> { vMps, aMps2, lastTsMs, lastLat, lastLon }
-
 // Cache: senaste kända product/to per tågnr (för att undvika null-flimmer)
 const lastKnownByTrainNo = new Map(); // trainNo -> { product, to, tsMs }
 const LAST_KNOWN_TTL_MS = 30 * 60 * 1000; // 30 min
@@ -557,203 +550,8 @@ function normalizeProduct(rawProduct) {
   return rawProduct;
 }
 
-function haversineKm(lat1, lon1, lat2, lon2) {
-  const R = 6371;
-  const toRad = (d) => (d * Math.PI) / 180;
-  const dLat = toRad(lat2 - lat1);
-  const dLon = toRad(lon2 - lon1);
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos(toRad(lat1)) * Math.cos(toRad(lat2)) * Math.sin(dLon / 2) ** 2;
-  return 2 * R * Math.asin(Math.sqrt(a));
-}
-
-// ===== BETTER SPEED ESTIMATION + CAP 200 =====
+// ===== CAP (behåller tidigare beteende: visa aldrig >200 km/h) =====
 const SPEED_CAP = 200;
-
-const MAX_SAMPLES = 10; // lite fler så median blir stabil
-const WINDOW_MS = 90_000; // analysera senaste 90s
-const MIN_SEG_DT_MS = 6_000; // minst 6s mellan punkter
-const MIN_SEG_DIST_KM = 0.05; // ignorera små hopp (brus)
-const REUSE_EST_MS = 90_000; // återanvänd senaste est om vi saknar underlag
-
-function pushSample(key, sample) {
-  const arr = lastSamplesByKey.get(key) ?? [];
-  const last = arr[arr.length - 1];
-
-  if (last && last.tsMs === sample.tsMs) {
-    arr[arr.length - 1] = sample;
-  } else {
-    arr.push(sample);
-  }
-
-  // trim + rensa för gamla (över WINDOW_MS) men behåll lite slack
-  const newest = arr[arr.length - 1]?.tsMs ?? sample.tsMs;
-  const minTs = newest - (WINDOW_MS + 60_000);
-  while (arr.length > 0 && arr[0].tsMs < minTs) arr.shift();
-  while (arr.length > MAX_SAMPLES) arr.shift();
-
-  lastSamplesByKey.set(key, arr);
-  return arr;
-}
-
-function median(values) {
-  if (!values.length) return null;
-  const a = [...values].sort((x, y) => x - y);
-  const mid = Math.floor(a.length / 2);
-  return a.length % 2 ? a[mid] : (a[mid - 1] + a[mid]) / 2;
-}
-
-// Bygger segmenthastigheter och tar median (robust mot outliers)
-function estimateSpeedFromSamples(key, current) {
-  const arr = lastSamplesByKey.get(key);
-  if (!arr || arr.length < 3) return null;
-  if (!Number.isFinite(current.tsMs)) return null;
-
-  const cutoff = current.tsMs - WINDOW_MS;
-
-  // välj samples inom fönster
-  const pts = arr.filter((s) => s.tsMs >= cutoff && s.tsMs <= current.tsMs);
-  if (pts.length < 3) return null;
-
-  const speeds = [];
-  for (let i = 1; i < pts.length; i++) {
-    const a = pts[i - 1];
-    const b = pts[i];
-    const dt = b.tsMs - a.tsMs;
-    if (dt < MIN_SEG_DT_MS) continue;
-
-    const dist = haversineKm(a.lat, a.lon, b.lat, b.lon);
-    if (!Number.isFinite(dist) || dist < MIN_SEG_DIST_KM) continue;
-
-    const v = dist / (dt / 3_600_000);
-    if (!Number.isFinite(v) || v < 2) continue;
-
-    speeds.push(Math.min(v, SPEED_CAP));
-  }
-
-  if (speeds.length < 2) return null;
-
-  // extra outlier-trim: ta bort topp 10% om många punkter
-  speeds.sort((x, y) => x - y);
-  if (speeds.length >= 6) {
-    const cut = Math.floor(speeds.length * 0.9);
-    speeds.length = Math.max(2, cut);
-  }
-
-  return median(speeds);
-}
-
-function smoothEstimate(key, rawEst, tsMs) {
-  const prev = lastEstSpeedByKey.get(key);
-  if (prev && Number.isFinite(prev.speed) && tsMs - prev.tsMs <= REUSE_EST_MS) {
-    // lite mindre “drag” än innan (snabbare att följa verkligheten)
-    return 0.55 * prev.speed + 0.45 * rawEst;
-  }
-  return rawEst;
-}
-
-// --- Bearing speed helpers (lokal meter-approx + along-track projektion) ---
-function latLonToLocalMeters(lat, lon, refLat, refLon) {
-  // Equirectangular approximation around ref point (meters)
-  const R = 6371000; // meters
-  const toRad = (d) => (d * Math.PI) / 180;
-
-  const phi = toRad(lat);
-  const phi0 = toRad(refLat);
-  const dPhi = toRad(lat - refLat);
-  const dLam = toRad(lon - refLon);
-
-  const x = R * dLam * Math.cos((phi + phi0) / 2); // east (m)
-  const y = R * dPhi; // north (m)
-  return { x, y };
-}
-
-function estimateSpeedWithBearingAlphaBeta(key, lat, lon, bearingDeg, tsMs) {
-  if (!Number.isFinite(tsMs)) return null;
-  if (typeof lat !== "number" || typeof lon !== "number") return null;
-  if (!Number.isFinite(bearingDeg)) return null;
-
-  const st = speedStateByKey.get(key);
-  if (!st) {
-    speedStateByKey.set(key, {
-      vMps: 0,
-      aMps2: 0,
-      lastTsMs: tsMs,
-      lastLat: lat,
-      lastLon: lon,
-    });
-    return null; // behöver minst 2 punkter
-  }
-
-  if (tsMs <= st.lastTsMs) return null;
-
-  const dt = (tsMs - st.lastTsMs) / 1000; // seconds
-  // Gate dt
-  if (dt < 0.5 || dt > 120) {
-    st.lastTsMs = tsMs;
-    st.lastLat = lat;
-    st.lastLon = lon;
-    return null;
-  }
-
-  const m = latLonToLocalMeters(lat, lon, st.lastLat, st.lastLon);
-  const dx = m.x;
-  const dy = m.y;
-
-  const distM = Math.hypot(dx, dy);
-
-  // Bearing 0=N, 90=E. x=east, y=north => unit=(sin, cos)
-  const th = (bearingDeg * Math.PI) / 180;
-  const ux = Math.sin(th);
-  const uy = Math.cos(th);
-
-  // Along-track (projektion längs bearing) -> mindre sidjitter
-  let along = dx * ux + dy * uy;
-
-  // FIX 1: hård clamp för att undvika "bakåthopp" => speed studs
-  if (along < 0) along = 0;
-
-  const instMps = along / dt;
-  const instKmh = instMps * 3.6;
-
-  // Outlier gates
-  const MAX_KMH_GATE = 350; // gate (display cap är 200)
-  const MIN_DIST_M = 12; // FIX 2: ignorera små hopp (brus) mer aggressivt
-  const ok = instKmh >= 0 && instKmh <= MAX_KMH_GATE && (distM >= MIN_DIST_M || dt >= 8);
-
-  // Uppdatera last oavsett, så vi inte “fastnar”
-  st.lastTsMs = tsMs;
-  st.lastLat = lat;
-  st.lastLon = lon;
-
-  if (!ok) return null;
-
-  // FIX 3: adaptiv alpha/beta (stabil vid låg fart, snabbare vid hög)
-  const vPred = st.vMps + st.aMps2 * dt;
-  const vKmhPred = Math.max(0, vPred * 3.6);
-
-  let alpha, beta;
-  if (vKmhPred < 30) {
-    alpha = 0.18;
-    beta = 0.03;
-  } else if (vKmhPred < 90) {
-    alpha = 0.25;
-    beta = 0.05;
-  } else {
-    alpha = 0.32;
-    beta = 0.07;
-  }
-
-  const r = instMps - vPred;
-
-  st.vMps = vPred + alpha * r;
-  st.aMps2 = st.aMps2 + (beta * r) / dt;
-
-  // Clamp till 0..SPEED_CAP
-  const vKmh = Math.max(0, st.vMps * 3.6);
-  return Math.min(SPEED_CAP, vKmh);
-}
 
 function normalizeTrain(tIn) {
   const t = { ...tIn };
@@ -799,49 +597,13 @@ function normalizeTrain(tIn) {
     }
   }
 
-  const key = `${t.depDate}_${t.trainNo}`;
-  const tsMs = Date.parse(t.timeStamp ?? "");
-
-  if (Number.isFinite(tsMs) && typeof t.lat === "number" && typeof t.lon === "number") {
-    pushSample(key, { lat: t.lat, lon: t.lon, tsMs });
-  }
-
   // clamp även “riktig” speed (så du aldrig visar >200)
   if (t.speed !== null && t.speed !== undefined && Number.isFinite(Number(t.speed))) {
     t.speed = Math.min(Number(t.speed), SPEED_CAP);
   }
 
-  // Estimera om null (bearing först, annars fallback till din tidigare median-metod)
+  // Ingen hastighetsestimering
   t._speedEstimated = false;
-  if (t.speed === null || t.speed === undefined) {
-    let est = null;
-
-    if (Number.isFinite(tsMs) && typeof t.lat === "number" && typeof t.lon === "number") {
-      est = estimateSpeedWithBearingAlphaBeta(key, t.lat, t.lon, Number(t.bearing), tsMs);
-      if (est !== null && Number.isFinite(est)) {
-        t.speed = Math.min(SPEED_CAP, Math.round(est));
-        t._speedEstimated = true;
-        lastEstSpeedByKey.set(key, { speed: t.speed, tsMs });
-      }
-    }
-
-    // Fallback till befintlig metod om bearing-estimat inte finns ännu
-    if (!t._speedEstimated && Number.isFinite(tsMs)) {
-      const raw = estimateSpeedFromSamples(key, { lat: t.lat, lon: t.lon, tsMs });
-      if (raw !== null) {
-        const smoothed = smoothEstimate(key, raw, tsMs);
-        t.speed = Math.min(SPEED_CAP, Math.round(smoothed));
-        t._speedEstimated = true;
-        lastEstSpeedByKey.set(key, { speed: t.speed, tsMs });
-      } else {
-        const prev = lastEstSpeedByKey.get(key);
-        if (prev && Number.isFinite(prev.speed) && tsMs - prev.tsMs <= REUSE_EST_MS) {
-          t.speed = Math.min(SPEED_CAP, prev.speed);
-          t._speedEstimated = true;
-        }
-      }
-    }
-  }
 
   return t;
 }
@@ -915,9 +677,6 @@ async function refresh() {
         if (map.hasLayer(marker)) map.removeLayer(marker);
         markers.delete(key);
         trainDataByKey.delete(key);
-        lastSamplesByKey.delete(key);
-        lastEstSpeedByKey.delete(key);
-        speedStateByKey.delete(key);
       }
     }
 
